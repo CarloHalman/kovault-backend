@@ -1,0 +1,62 @@
+# Kovault stack (compose project `kovault`): two containers, grouped together.
+#   kovault-db   — PostgreSQL + pgvector + pg_search + pg_trgm
+#   kovault-mcp  — the MCP server (../mcp-server); only it holds DB credentials
+# The embedding model is a SEPARATE, reusable service — see ../embedding/. kovault-mcp calls
+# whatever URL is in the `embedding` DB setting (02-init.sql); default reaches the host at
+# :11434 via host.docker.internal, so the embedding can be the ../embedding/ stack, an existing
+# Ollama, or any OpenAI-compatible endpoint on another box.
+name: kovault
+
+services:
+  kovault-db:
+    restart: unless-stopped         # returns after a host reboot
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: postgres -c shared_preload_libraries=pg_search,pg_cron   # pg_cron required by paradedb image bootstrap; add ',age' only if AGE is re-added
+    environment:
+      POSTGRES_DB: kovault
+      POSTGRES_USER: kovault
+      POSTGRES_PASSWORD_FILE: /run/secrets/kovault_db_password
+    ports:
+      - "5433:5432"     # host DB port (pgAdmin/debug only); change if 5433 is taken
+    volumes:
+      - kovault-data:/var/lib/postgresql/data
+    secrets:
+      - kovault_db_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kovault -d kovault"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  kovault-mcp:
+    restart: unless-stopped
+    build:
+      context: ../mcp-server
+      dockerfile: Dockerfile
+    depends_on:
+      kovault-db:
+        condition: service_healthy
+    environment:
+      # Only the MCP server knows the DB DSN. Password comes from the same secret file.
+      KOVAULT_DB_HOST: kovault-db
+      KOVAULT_DB_PORT: "5432"
+      KOVAULT_DB_NAME: kovault
+      KOVAULT_DB_USER: kovault
+      KOVAULT_DB_PASSWORD_FILE: /run/secrets/kovault_db_password
+      KOVAULT_MCP_HOST: 0.0.0.0
+      KOVAULT_MCP_PORT: "8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # so the embedding endpoint (host :11434) resolves on Linux too
+    ports:
+      - "8000:8000"     # the HTTP endpoint users' plugins connect to
+    secrets:
+      - kovault_db_password
+
+volumes:
+  kovault-data:
+
+secrets:
+  kovault_db_password:
+    file: ./secrets/kovault_db_password.txt   # cp secrets/kovault_db_password.txt.example and edit

@@ -1,0 +1,19 @@
+Third-party licenses
+====================
+
+Kovault backend ships the following third-party Python packages inside the
+kovault-mcp Docker image. Each is distributed under its own license, reproduced/obtainable at
+the upstream links below.
+
+- fastmcp — Apache-2.0 — MCP server framework.
+  https://github.com/jlowin/fastmcp
+
+- psycopg (psycopg3) — LGPL-3.0-only — PostgreSQL database adapter.
+  https://github.com/psycopg/psycopg
+
+- httpx — BSD-3-Clause — HTTP client used for the embedding endpoint.
+  https://github.com/encode/httpx
+
+Not redistributed (pulled by the operator at deploy time, not bundled in this repo's images):
+the ParadeDB/PostgreSQL image, Ollama, and any embedding model (e.g. Qwen3-Embedding). These
+carry their own licenses from their respective upstreams.

@@ -1,0 +1,30 @@
+# Standalone embedding service (compose project `embedding`) — its own group, on purpose.
+# This is a generic OpenAI-compatible embedding endpoint (Ollama). It is NOT Kovault-specific:
+# any app can point at http://<host>:11434/v1. Kovault's kovault-mcp reaches it via the host
+# (host.docker.internal:11434) using the endpoint stored in the DB `embedding` setting.
+#
+# GPU is used only WHILE embedding (OLLAMA_KEEP_ALIVE frees VRAM after), not 24/7.
+# Drop the `deploy.resources` block to run CPU-only.
+name: embedding
+
+services:
+  embedding:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    environment:
+      OLLAMA_KEEP_ALIVE: "5m"           # unload model from VRAM 5 min after the last embed
+      OLLAMA_MAX_LOADED_MODELS: "1"
+    volumes:
+      - ollama-models:/root/.ollama
+    ports:
+      - "11434:11434"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  ollama-models:
