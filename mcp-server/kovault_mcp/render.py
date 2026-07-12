@@ -16,6 +16,20 @@ def _ts(v) -> str:
     return str(v)
 
 
+def _q(v) -> str:
+    """YAML-safe scalar for a frontmatter value. Plain when safe; double-quoted + escaped when the
+    text holds a YAML indicator that would break the property block: a ': ' (colon-space, e.g. a
+    title/description with a colon, or a group `members:` line), a leading indicator char, a '#',
+    or a newline. Without this, Obsidian reads the second key as nested and the block breaks."""
+    s = "" if v is None else str(v)
+    if not s:
+        return ""
+    if (": " in s or s[0] in "-?:#&*!|>'\"%@`[]{}," or s.endswith(":")
+            or s.strip() != s or "\n" in s or "#" in s):
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
+    return s
+
+
 def _list(v) -> str:
     if not v:
         return ""
@@ -44,13 +58,13 @@ def render_page(page: dict, headers: list[dict]) -> str:
     fm = [
         "---",
         f"type: {page.get('type') or ''}",
-        f"title: {page.get('title') or ''}",
+        f"title: {_q(page.get('title') or '')}",
         f"id: {page.get('id')}",
-        f"description: {page.get('summary') or ''}",
+        f"description: {_q(page.get('summary') or '')}",
         f"created: {_ts(page.get('created_at'))}",
         f"updated: {_ts(page.get('updated_at'))}",
         f"freshness: {page.get('freshness') or ''}",
-        f"contributors: {_list(page.get('contributors'))}",
+        f"contributors: {_q(_list(page.get('contributors')))}",
         "---",
         page.get("title") or "",
         "",
@@ -63,18 +77,18 @@ def render_task(t: dict, blockers: list[str] | None = None, links: list[tuple[st
     return "\n".join([
         "---",
         "type: task",
-        f"title: {t.get('title') or ''}",
+        f"title: {_q(t.get('title') or '')}",
         f"id: {t.get('id')}",
-        f"description: {t.get('description') or ''}",
+        f"description: {_q(t.get('description') or '')}",
         f"created: {_ts(t.get('created_at'))}",
         f"updated: {_ts(t.get('updated_at'))}",
         f"status: {t.get('status') or ''}",
         f"priority: {t.get('priority') or ''}",
         f"scope: {t.get('scope') or ''}",
         f"deadline: {_ts(t.get('deadline'))}",
-        f"responsible: {_list(t.get('responsible'))}",
-        f"blockers: {_list(blockers)}",
-        f"related: {_related(links)}",
+        f"responsible: {_q(_list(t.get('responsible')))}",
+        f"blockers: {_q(_list(blockers))}",
+        f"related: {_q(_related(links))}",
         "---",
     ]) + "\n"
 
@@ -83,14 +97,14 @@ def render_decision(d: dict, links: list[tuple[str, str]] | None = None) -> str:
     return "\n".join([
         "---",
         "type: decision",
-        f"title: {d.get('title') or ''}",
+        f"title: {_q(d.get('title') or '')}",
         f"id: {d.get('id')}",
-        f"description: {d.get('description') or ''}",
+        f"description: {_q(d.get('description') or '')}",
         f"created: {_ts(d.get('created_at'))}",
         f"updated: {_ts(d.get('updated_at'))}",
         f"at: {_ts(d.get('decided_at'))}",
-        f"by: {d.get('decided_by') or ''}",
-        f"related: {_related(links)}",
+        f"by: {_q(d.get('decided_by') or '')}",
+        f"related: {_q(_related(links))}",
         "---",
     ]) + "\n"
 
@@ -100,14 +114,14 @@ def render_source(s: dict, referenced_by: list[str] | None = None) -> str:
         "---",
         "type: source",
         f"sourcetype: {s.get('type') or ''}",
-        f"title: {s.get('title') or ''}",
-        f"reference: {s.get('reference') or ''}",
+        f"title: {_q(s.get('title') or '')}",
+        f"reference: {_q(s.get('reference') or '')}",
         f"id: {s.get('id')}",
-        f"description: {s.get('summary') or ''}",
+        f"description: {_q(s.get('summary') or '')}",
         f"created: {_ts(s.get('created_at'))}",
         f"updated: {_ts(s.get('updated_at'))}",
         f"sha256: {s.get('sha256') or ''}",
-        f"referenced by: {_list(referenced_by)}",
+        f"referenced by: {_q(_list(referenced_by))}",
         "---",
     ]) + "\n"
 
@@ -119,10 +133,10 @@ def render_group(g: dict, members: list[tuple[str, str, str]] | None = None) -> 
         "---",
         "type: group",
         f"grouptype: {g.get('type') or ''}",
-        f"name: {g.get('name') or ''}",
+        f"name: {_q(g.get('name') or '')}",
         f"id: {g.get('id')}",
-        f"description: {g.get('description') or ''}",
-        f"participants: {_list(g.get('participants'))}",
-        f"members: {member_str}",
+        f"description: {_q(g.get('description') or '')}",
+        f"participants: {_q(_list(g.get('participants')))}",
+        f"members: {_q(member_str)}",
         "---",
     ]) + "\n"

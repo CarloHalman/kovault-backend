@@ -12,12 +12,17 @@ through as-is. Selectable scope: everything, whole entity tables, or specific ro
 from __future__ import annotations
 
 import argparse
+import os
 import re
+from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .config import Config
-from .db import Database
 from . import render as rnd
+
+if TYPE_CHECKING:  # avoid importing the psycopg-backed db module for the pure render/pathing code
+    from .db import Database
 
 TABLES = ("pages", "tasks", "decisions", "sources", "groups")
 
@@ -25,6 +30,46 @@ TABLES = ("pages", "tasks", "decisions", "sources", "groups")
 def _slug(text: str, fallback: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
     return s or fallback
+
+
+def _seg(v, fallback: str = "unknown") -> str:
+    """A folder-name segment from an enum/label value (status, page type, freshness, grouptype)."""
+    return _slug(str(v or ""), "") or fallback
+
+
+def _ext_seg(reference: str | None) -> str:
+    """Extension bucket for a `file` source: '/x/a.MD' -> 'md', no extension -> 'no-ext'."""
+    name = (reference or "").split("?")[0].split("#")[0]
+    ext = os.path.splitext(name)[1].lstrip(".").lower()
+    return _slug(ext, "") or "no-ext"
+
+
+def _isoweek(v) -> str:
+    """ISO year-week folder like '2026-W28' from a datetime/date/ISO string; 'undated' if missing."""
+    if v is None:
+        return "undated"
+    if isinstance(v, str):
+        try:
+            v = datetime.fromisoformat(v)
+        except ValueError:
+            return "undated"
+    y, w, _ = v.isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+def _uniq(used: set, rel: str) -> str:
+    """Collision-proof a relpath: two rows that slug to the same file in the same folder get
+    -01, -02 … suffixes, so a distinct DB row is never silently overwritten by another."""
+    if rel not in used:
+        used.add(rel)
+        return rel
+    base, _, ext = rel.rpartition(".")
+    i = 1
+    while f"{base}-{i:02d}.{ext}" in used:
+        i += 1
+    out = f"{base}-{i:02d}.{ext}"
+    used.add(out)
+    return out
 
 
 def _links_of(dbx: Database, kind: str, rid: str) -> list[tuple[str, str]]:
@@ -70,35 +115,54 @@ def _apply_wikilinks(dbx: Database, files: list[tuple[str, str]]) -> list[tuple[
 
 def build_bundle(dbx: Database, tables: list[str], ids: list[str] | None,
                  wikilinks: bool = False) -> list[tuple[str, str]]:
-    """Render the selected scope to an in-memory OKF bundle: [(relpath, content), ...],
-    including index.md (listing) and log.md (edits). No disk writes, so the same renderer feeds
-    the CLI exporter (to a folder) and the /export HTTP route (to a streamed zip)."""
+    """Render the selected scope to an in-memory OKF bundle: [(relpath, content), ...], including
+    index.md (listing) and log.md (edits). No disk writes, so the same renderer feeds the CLI
+    exporter (to a folder) and the /export HTTP route (to a streamed zip).
+
+    Folder tree, so a big vault stays navigable in Obsidian:
+      pages/<type>/<freshness>/     tasks/<status>/     decisions/<ISO-week>/
+      sources/<sourcetype>/  (a `file` source splits again by extension: sources/file/<ext>/)
+      groups/<grouptype>/
+    Two rows that slug to the same filename in one folder get -01/-02 suffixes (no silent
+    overwrite of a distinct id)."""
     files: list[tuple[str, str]] = []
     listing: list[str] = ["# Kovault export (OKF bundle)", ""]
     id_filter = " AND id = ANY(%s)" if ids else ""
     id_param = [ids] if ids else []
+    used: set = set()
+
+    def emit(rel: str, content: str, label: str, kind: str) -> None:
+        rel = _uniq(used, rel)
+        files.append((rel, content))
+        listing.append(f"- [{label}]({rel}) — {kind}")
 
     if "pages" in tables:
         pages = dbx.query(f"SELECT * FROM pages WHERE freshness <> 'trashed'{id_filter} ORDER BY title", id_param)
         for p in pages:
             hs = dbx.query("SELECT * FROM headers WHERE page_id=%s AND trashed_at IS NULL ORDER BY index", (p["id"],))
-            rel = f"pages/{_slug(p['title'], str(p['id']))}.md"
-            files.append((rel, rnd.render_page(p, hs)))
-            listing.append(f"- [{p['title']}]({rel}) — {p.get('type') or 'page'}")
+            rel = f"pages/{_seg(p.get('type'), 'page')}/{_seg(p.get('freshness'))}/{_slug(p['title'], str(p['id']))}.md"
+            emit(rel, rnd.render_page(p, hs), p["title"], p.get("type") or "page")
 
-    for table, kind, renderer in (
-        ("tasks", "task", _render_task_export),
-        ("decisions", "decision", _render_decision_export),
-        ("sources", "source", _render_source_export),
-    ):
-        if table not in tables:
-            continue
-        rowsx = dbx.query(f"SELECT * FROM {table} WHERE trashed_at IS NULL{id_filter} ORDER BY created_at", id_param)
-        for r in rowsx:
+    if "tasks" in tables:
+        for r in dbx.query(f"SELECT * FROM tasks WHERE trashed_at IS NULL{id_filter} ORDER BY created_at", id_param):
+            title = r.get("title") or str(r["id"])
+            rel = f"tasks/{_seg(r.get('status'))}/{_slug(title, str(r['id']))}.md"
+            emit(rel, _render_task_export(dbx, r), title, "task")
+
+    if "decisions" in tables:
+        for r in dbx.query(f"SELECT * FROM decisions WHERE trashed_at IS NULL{id_filter} ORDER BY created_at", id_param):
+            title = r.get("title") or str(r["id"])
+            week = _isoweek(r.get("decided_at") or r.get("created_at"))
+            rel = f"decisions/{week}/{_slug(title, str(r['id']))}.md"
+            emit(rel, _render_decision_export(dbx, r), title, "decision")
+
+    if "sources" in tables:
+        for r in dbx.query(f"SELECT * FROM sources WHERE trashed_at IS NULL{id_filter} ORDER BY created_at", id_param):
             title = r.get("title") or r.get("reference") or str(r["id"])
-            rel = f"{table}/{_slug(title, str(r['id']))}.md"
-            files.append((rel, renderer(dbx, r)))
-            listing.append(f"- [{title}]({rel}) — {kind}")
+            st = _seg(r.get("type"))
+            sub = f"file/{_ext_seg(r.get('reference'))}" if st == "file" else st
+            rel = f"sources/{sub}/{_slug(title, str(r['id']))}.md"
+            emit(rel, _render_source_export(dbx, r), title, "source")
 
     if "groups" in tables:
         gs = dbx.query(f"SELECT * FROM groups{(' WHERE id = ANY(%s)' if ids else '')} ORDER BY name", id_param)
@@ -109,9 +173,9 @@ def build_bundle(dbx: Database, tables: list[str], ids: list[str] | None,
                 "LEFT JOIN pages p ON p.id=e.id LEFT JOIN tasks t ON t.id=e.id "
                 "LEFT JOIN decisions d ON d.id=e.id LEFT JOIN sources s ON s.id=e.id "
                 "WHERE gl.group_id=%s", (g["id"],))
-            rel = f"groups/{_slug(g['name'], str(g['id']))}.md"
-            files.append((rel, rnd.render_group(g, [(m["kind"], str(m["id"]), m["label"] or "") for m in members])))
-            listing.append(f"- [{g['name']}]({rel}) — group")
+            rel = f"groups/{_seg(g.get('type'))}/{_slug(g['name'], str(g['id']))}.md"
+            emit(rel, rnd.render_group(g, [(m["kind"], str(m["id"]), m["label"] or "") for m in members]),
+                 g["name"], "group")
 
     files.append(("index.md", "\n".join(listing) + "\n"))
 
@@ -127,6 +191,7 @@ def build_bundle(dbx: Database, tables: list[str], ids: list[str] | None,
 
 def export(out_dir: str, tables: list[str], ids: list[str] | None, wikilinks: bool = False) -> list[str]:
     """CLI/backup path: render the bundle and write it to a folder tree. Returns file paths."""
+    from .db import Database
     dbx = Database(Config())
     dbx.open()
     try:

@@ -58,7 +58,18 @@ class TestRender(unittest.TestCase):
              "participants": ["carlo"]}
         out = r.render_group(g, [("page", U, "Deploy")])
         self.assertIn("grouptype: project", out)
-        self.assertIn(f"members: page: {U} — Deploy", out)
+        # members line holds ': ' (colon-space) so it must be quoted or the YAML block breaks
+        self.assertIn(f'members: "page: {U} — Deploy"', out)
+
+    def test_colon_values_are_quoted(self):
+        # a title/description with ': ' must be quoted so Obsidian doesn't read the tail as a nested key
+        t = {"id": U, "title": "Plan: beat the old", "description": "two gaps: (1) a, (2) b",
+             "status": "todo", "priority": "low", "scope": "days",
+             "created_at": None, "updated_at": None, "deadline": None, "responsible": ["carlo"]}
+        out = r.render_task(t)
+        self.assertIn('title: "Plan: beat the old"', out)
+        self.assertIn('description: "two gaps: (1) a, (2) b"', out)
+        self.assertIn("status: todo", out)  # clean values stay plain
 
 
 if __name__ == "__main__":
