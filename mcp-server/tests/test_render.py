@@ -41,6 +41,14 @@ class TestRender(unittest.TestCase):
         self.assertNotIn("h2", out)                      # no header id
         self.assertNotIn("[!info]", out)
 
+    def test_table_leading_body_gets_blank_line(self):
+        # a body starting with a markdown table needs a blank line above the pipe row, or GFM
+        # reads it as a paragraph and the table never renders (the Heimdall export bug)
+        h = {"id": "h1", "title": "Hardware", "body": "| A | B |\n| --- | --- |\n| 1 | 2 |",
+             "page_id": U, "index": 1}
+        self.assertIn("\n\n| A | B |", r.render_chunk(h, standalone=False))
+        self.assertIn("\n\n| A | B |", r.render_chunk(h, standalone=True))
+
     def test_task_frontmatter(self):
         t = {"id": U, "title": "ship", "description": "d", "status": "todo", "priority": "high",
              "scope": "days", "created_at": None, "updated_at": None, "deadline": None,

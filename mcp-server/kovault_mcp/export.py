@@ -33,7 +33,7 @@ def _slug(text: str, fallback: str) -> str:
 
 
 def _seg(v, fallback: str = "unknown") -> str:
-    """A folder-name segment from an enum/label value (status, page type, freshness, grouptype)."""
+    """A folder-name segment from an enum/label value (status, page type, grouptype)."""
     return _slug(str(v or ""), "") or fallback
 
 
@@ -120,7 +120,7 @@ def build_bundle(dbx: Database, tables: list[str], ids: list[str] | None,
     exporter (to a folder) and the /export HTTP route (to a streamed zip).
 
     Folder tree, so a big vault stays navigable in Obsidian:
-      pages/<type>/<freshness>/     tasks/<status>/     decisions/<ISO-week>/
+      pages/<type>/     tasks/<status>/     decisions/<ISO-week>/
       sources/<sourcetype>/  (a `file` source splits again by extension: sources/file/<ext>/)
       groups/<grouptype>/
     Two rows that slug to the same filename in one folder get -01/-02 suffixes (no silent
@@ -140,7 +140,7 @@ def build_bundle(dbx: Database, tables: list[str], ids: list[str] | None,
         pages = dbx.query(f"SELECT * FROM pages WHERE freshness <> 'trashed'{id_filter} ORDER BY title", id_param)
         for p in pages:
             hs = dbx.query("SELECT * FROM headers WHERE page_id=%s AND trashed_at IS NULL ORDER BY index", (p["id"],))
-            rel = f"pages/{_seg(p.get('type'), 'page')}/{_seg(p.get('freshness'))}/{_slug(p['title'], str(p['id']))}.md"
+            rel = f"pages/{_seg(p.get('type'), 'page')}/{_slug(p['title'], str(p['id']))}.md"
             emit(rel, rnd.render_page(p, hs), p["title"], p.get("type") or "page")
 
     if "tasks" in tables:

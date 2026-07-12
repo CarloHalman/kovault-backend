@@ -92,7 +92,7 @@ class TestBundleLayout(unittest.TestCase):
         paths = _bundle_paths(self._rows())
         d = datetime(2026, 7, 6)
         wk = f"{d.isocalendar()[0]}-W{d.isocalendar()[1]:02d}"
-        self.assertIn("pages/note/hot/alpha-one.md", paths)
+        self.assertIn("pages/note/alpha-one.md", paths)   # no freshness subfolder
         self.assertIn("tasks/done/do-x.md", paths)
         self.assertIn(f"decisions/{wk}/pick-y.md", paths)
         self.assertIn("sources/file/md/my-notes.md", paths)   # file source split by extension

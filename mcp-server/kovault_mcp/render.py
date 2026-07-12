@@ -48,6 +48,7 @@ def render_chunk(h: dict, standalone: bool = True) -> str:
     lines = [h.get("title") or "(intro)"]
     if standalone:
         lines.append(f"> page: {h.get('page_id')} · index: {h.get('index')}")
+    lines.append("")                      # blank line so a body starting with a table renders
     lines.append(h.get("body") or "")
     return "\n".join(lines).rstrip() + "\n"
 
