@@ -13,9 +13,9 @@ and edit logging.
 | `fetch` | read | Full page / chunk / task / decision / source / group. |
 | `snippet` | read | id/title/summary/freshness for expanding links. |
 | `rows` | read | Backup raw read of any table (op whitelist, hard limit, every call logged). |
-| `insert` | write | Create rows; embeds, parses links, logs edits. |
-| `update` | write | Edit rows; re-embeds/re-links, page-rename cascade, appends contributors, logs edits. |
-| `delete` | write | Trash only (nothing hard-deletes). |
+| `sql` | read | Debug-only raw read-only SQL (gated on debug mode, every call logged). |
+| `write` | write | Unified create / update / trash for every entity via `---`-fenced blocks; embeds, parses links, page-rename cascade, appends contributors, logs edits. |
+| `insert` / `update` / `delete` | write | Legacy single-entity create / edit / trash. Still work but **deprecated** in favor of `write`. |
 | `link` | write | Manual fix for auto-linking (links / header_sources / task_dependencies / group_links). |
 | `group` | write | Create/manage flexible categories + membership. |
 | `janitor` | write | Maintenance: diagnose (bare) + `-lint` / `-freshness` / `-dedupe` / `-embed`. |
@@ -52,7 +52,7 @@ python -m kovault_mcp.main            # serves http://0.0.0.0:8000/mcp
 ## Identity
 
 `edited_by` / `actor` are never model-set. The plugin injects them via `X-Kovault-User` /
-`X-Kovault-Actor` HTTP headers (configured by `/setup-kovault`); the server falls back to
+`X-Kovault-Actor` HTTP headers (configured by `/kovault:setup`); the server falls back to
 `KOVAULT_DEFAULT_USER` / `KOVAULT_DEFAULT_ACTOR` env.
 
 ## Deploy-time check

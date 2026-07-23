@@ -84,18 +84,18 @@ docker compose exec kovault-db psql -U kovault -d kovault -c "SELECT key FROM se
 ```
 
 The MCP server is now serving at **`http://<your-host>:8000/mcp`**. That URL is what you give
-the plugin's `/setup-kovault`.
+the plugin's `/kovault:setup`.
 
 ## 6. Identity headers
 
-The server reads `X-Kovault-User` / `X-Kovault-Actor` HTTP headers (the plugin's `/setup-kovault`
+The server reads `X-Kovault-User` / `X-Kovault-Actor` HTTP headers (the plugin's `/kovault:setup`
 sets these) to stamp edits. You can set fallbacks with `KOVAULT_DEFAULT_USER` /
 `KOVAULT_DEFAULT_ACTOR` env on the `kovault-mcp` service.
 
 ## Notes
 
 - **Change the embedding model later?** Re-point the `embedding` setting, keep `dims` matching
-  the `halfvec(N)`, then run `/janitor-kovault -embed` to re-embed everything. Changing dims
+  the `halfvec(N)`, then run `/kovault:janitor -embed` to re-embed everything. Changing dims
   means a schema change + full re-ingest.
 - **BM25 (pg_search)** is the one API that varies across ParadeDB releases; if keyword search
   errors, confirm the `USING bm25 (...) WITH (key_field='id')` indexes and the `col @@@ 'terms'`
