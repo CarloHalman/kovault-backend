@@ -938,19 +938,19 @@ _SQL_BLOCK = re.compile(r"\b(insert|update|delete|drop|alter|truncate|create|gra
 
 
 @mcp.tool
-def sql(query: str) -> str:
+def read_sql(query: str) -> str:
     """Debug only: run a raw READ-ONLY SQL query (SELECT / WITH) against the Kovault DB, to experiment
     with retrieval the fixed tools don't express — so we can compare your queries to them. Enabled
     only when `debug` is on in /settings (the PreToolUse hook blocks it otherwise), and every call
     is logged to debug_log. Writes and DDL are refused, the query runs in a READ ONLY transaction,
-    and the result is capped."""
+    and the result is capped. For writes/DDL use `write_sql` (also debug-only)."""
     q = (query or "").strip().rstrip(";")
     low = q.lower()
     if not (low.startswith("select") or low.startswith("with")):
-        return "(only SELECT / WITH queries allowed)"
+        return "(only SELECT / WITH queries allowed — use write_sql for writes/DDL)"
     if _SQL_BLOCK.search(low):
-        return "(read-only: write/DDL keywords are not allowed)"
-    log.info("sql tool: %s", q)
+        return "(read-only: write/DDL keywords are not allowed — use write_sql)"
+    log.info("read_sql tool: %s", q)
     try:
         with db().connection() as conn:
             with conn.cursor() as cur:
@@ -963,6 +963,36 @@ def sql(query: str) -> str:
     if not out:
         return "(no rows)"
     return "\n".join(" | ".join(f"{c}: {r[c]}" for c in r) for r in out)
+
+
+@mcp.tool
+def write_sql(query: str) -> str:
+    """Debug only: run a raw READ-WRITE SQL statement (INSERT / UPDATE / DELETE / DDL) against the
+    Kovault DB — the escape hatch for a change the fixed write tools (`write` / `group` / `link` /
+    `janitor`) can't express. Enabled only when `debug` is on (the PreToolUse hook blocks it
+    otherwise); EVERY call is logged (server log + debug_log) so a reliance on it flags a gap in the
+    real tools and where a fallback was needed. Runs in a normal read-write transaction and COMMITS
+    on success — it can modify data and schema, and it bypasses embedding / link / edit-log upkeep
+    the fixed tools do, so reach for it only when they genuinely fall short. A statement with a
+    RETURNING clause echoes its rows (capped); otherwise the affected row count."""
+    q = (query or "").strip().rstrip(";")
+    if not q:
+        return "(empty query)"
+    log.warning("write_sql tool (raw write, fixed-tool fallback): %s", q)
+    try:
+        with db().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(q)
+                rc = cur.rowcount
+                rows = cur.fetchall() if cur.description else None
+            conn.commit()
+    except Exception as e:
+        return f"(sql error: {e})"
+    if rows is not None:
+        capped = rows[:ROWS_LIMIT_CAP]
+        body = "\n".join(" | ".join(f"{c}: {r[c]}" for c in r) for r in capped) or "(no rows)"
+        return f"ok ({len(rows)} row(s) returned)\n{body}"
+    return f"ok ({rc} row(s) affected)"
 
 
 # =======================================================================================
