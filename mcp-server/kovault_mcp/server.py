@@ -20,6 +20,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from . import blocks as bl
 from . import embedding_text as et
 from . import export as export_mod
 from . import render as rnd
@@ -64,16 +65,20 @@ def _embedder() -> EmbeddingClient:
 
 
 def _identity() -> tuple[str, str]:
-    """(edited_by, actor). From plugin-set HTTP headers; else env defaults."""
+    """(edited_by, actor). From plugin-set HTTP headers; else env defaults. The username is
+    normalized (trim + lowercase) here so casing variants (e.g. Alice/alice) don't split
+    attribution or owner:* groups (forward-only; existing rows are not backfilled)."""
+    def norm(u: str | None) -> str:
+        return (u or "").strip().lower()
     try:
         from fastmcp.server.dependencies import get_http_headers
         h = get_http_headers() or {}
         user = h.get("x-kovault-user")
         if user:
-            return user, h.get("x-kovault-actor", "ai")
+            return norm(user), h.get("x-kovault-actor", "ai")
     except Exception:
         pass
-    return os.getenv("KOVAULT_DEFAULT_USER", "unknown"), os.getenv("KOVAULT_DEFAULT_ACTOR", "ai")
+    return norm(os.getenv("KOVAULT_DEFAULT_USER", "unknown")), os.getenv("KOVAULT_DEFAULT_ACTOR", "ai")
 
 
 def _now() -> datetime:
@@ -87,6 +92,54 @@ def _cols(table: str) -> set[str]:
         )
         _COLS_CACHE[table] = {r["column_name"] for r in rows}
     return _COLS_CACHE[table]
+
+
+# ---- enum validation at the write boundary (F5) ---------------------------------------
+# enum columns per table (pages.type is free OKF text, so not listed). Values are checked
+# against pg_enum; a known alias is auto-normalized and reported; anything else is a clear error.
+_ENUM_COLS = {
+    "tasks": {"status": "task_status", "priority": "task_priority", "scope": "task_scope"},
+    "pages": {"freshness": "page_freshness"},
+    "sources": {"type": "source_type"},
+    "groups": {"type": "group_types"},
+}
+_ENUM_ALIASES = {
+    "task_status": {"complete": "done", "completed": "done", "finished": "done",
+                    "in progress": "doing", "in_progress": "doing", "wip": "doing",
+                    "active": "doing", "open": "todo", "backlog": "todo"},
+    "task_priority": {"med": "medium", "normal": "medium", "critical": "urgent"},
+}
+_ENUM_CACHE: dict = {}
+
+
+def _enum_values(name: str) -> set[str]:
+    if name not in _ENUM_CACHE:
+        _ENUM_CACHE[name] = {r["enumlabel"] for r in db().query(
+            "SELECT enumlabel FROM pg_enum e JOIN pg_type t ON t.oid=e.enumtypid WHERE t.typname=%s",
+            (name,))}
+    return _ENUM_CACHE[name]
+
+
+def _check_enums(table: str, fields: dict) -> tuple[list[str], str | None]:
+    """Validate/normalize enum-valued fields in place before a write. Returns (notes, error):
+    a known alias (completed->done) is corrected and reported; a truly invalid value returns a
+    clear 'valid: [...]' error so the caller self-corrects instead of hitting a raw Postgres error."""
+    notes: list[str] = []
+    for col, enum_name in _ENUM_COLS.get(table, {}).items():
+        if col not in fields or fields[col] is None:
+            continue
+        val = str(fields[col]).strip()
+        valid = _enum_values(enum_name)
+        if val in valid:
+            fields[col] = val
+            continue
+        alias = _ENUM_ALIASES.get(enum_name, {}).get(val.lower())
+        if alias and alias in valid:
+            fields[col] = alias
+            notes.append(f"normalized {col} '{val}'->'{alias}'")
+            continue
+        return notes, f"field '{col}': '{val}' invalid, valid: [{','.join(sorted(valid))}]"
+    return notes, None
 
 
 # =======================================================================================
@@ -292,6 +345,45 @@ def _keyword_hits(table: str, inc: str, exc: str) -> dict[str, dict]:
     return out
 
 
+# normalized-title columns per table for the trigram arm (F2). headers also carry blurb_norm.
+_NORM_COLS = {"headers": ["title_norm", "blurb_norm"], "tasks": ["title_norm"],
+              "decisions": ["title_norm"], "sources": ["title_norm"]}
+
+
+def _trigram_hits(table: str, qnorm: str) -> dict[str, dict]:
+    """Fuzzy surface-form arm: pg_trgm similarity of the query (normalized the same way) against the
+    normalized-title column(s). Catches E-drawing/Edrawing, Emp-Viewer/employee viewer that exact
+    BM25 tokens miss. Its own signal — fused as a 4th RRF rank map, never mixed into the BM25 score."""
+    if not qnorm:
+        return {}
+    meta = _SEARCH[table]
+    cols = _NORM_COLS[table]
+    sim = "GREATEST(" + ",".join(f"similarity({c}, %(q)s)" for c in cols) + ")"
+    where = " OR ".join(f"{c} %% %(q)s" for c in cols)   # %% -> literal % (the pg_trgm operator)
+    if table == "headers":
+        sql = f"""
+            SELECT h.id, h.page_id, h.title, h.blurb AS disp, {sim} AS score
+            FROM headers h JOIN pages p ON p.id = h.page_id
+            WHERE h.trashed_at IS NULL AND ({where})
+              AND p.freshness NOT IN ('trashed','archived')
+            ORDER BY score DESC LIMIT %(n)s
+        """
+    else:
+        sql = f"""
+            SELECT id, NULL::uuid AS page_id, title, {meta['disp']} AS disp, {sim} AS score
+            FROM {table}
+            WHERE trashed_at IS NULL AND ({where})
+            ORDER BY score DESC LIMIT %(n)s
+        """
+    out = {}
+    for r in db().query(sql, {"q": qnorm, "n": SEARCH_LIMIT}):
+        out[str(r["id"])] = {
+            "id": str(r["id"]), "page_id": str(r["page_id"]) if r["page_id"] else None,
+            "title": r["title"], "disp": r["disp"], "trigram": float(r["score"]),
+        }
+    return out
+
+
 def _graph_points(include: list[str], exclude: list[str]) -> dict[tuple[str, str], int]:
     """(kind, id) -> summed hop points: +max(0,4-hops) per good topic, -same per bad topic."""
     pts: dict[tuple[str, str], int] = {}
@@ -362,6 +454,56 @@ def _maybe_auto_freshness() -> None:
         log.warning("auto-freshness skipped: %s", e)
 
 
+_PRECISE_TABLES = ("pages", "headers", "tasks", "decisions", "sources", "groups")
+_PRECISE_DISP = {"headers": "blurb", "tasks": "description", "decisions": "description",
+                 "sources": "summary", "pages": "summary", "groups": "description"}
+
+
+def _precise_lookup(tables, filters, count, limit, offset) -> str:
+    """Deterministic exact-filter query (F3) — the first-class replacement for reaching to `rows`/`sql`
+    for audits. Filters/paginates ONE table with an op whitelist; returns hits:N and a compact list."""
+    table = (tables or ["tasks"])[0]
+    if table not in _PRECISE_TABLES:
+        return f"(precise: table must be one of {', '.join(_PRECISE_TABLES)})"
+    cols = _cols(table)
+    clauses, params = [], []
+    if "trashed_at" in cols:
+        clauses.append("trashed_at IS NULL")
+    elif table == "pages":
+        clauses.append("freshness <> 'trashed'")
+    for f in filters or []:
+        col, op, val = f.get("column"), (f.get("op") or "=").lower(), f.get("value")
+        if col not in cols:
+            return f"(precise: unknown column {col} on {table})"
+        if op not in ROWS_OPS:
+            return f"(precise: op {op} not allowed; use {', '.join(sorted(ROWS_OPS))})"
+        if op == "in":
+            clauses.append(f"{col} = ANY(%s)")
+            params.append(val if isinstance(val, list) else [val])
+        elif op == "ilike":
+            clauses.append(f"{col} ILIKE %s")
+            params.append(val)
+        else:
+            clauses.append(f"{col} {op} %s")
+            params.append(val)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    total = int(db().query_one(f"SELECT count(*) n FROM {table}{where}", params)["n"])
+    if count:
+        return f"PRECISE {table}\nhits: {total}"
+    lim = max(1, min(int(limit or 50), ROWS_LIMIT_CAP))
+    off = max(0, int(offset or 0))
+    label = "name" if table == "groups" else "title"
+    order = "created_at DESC" if "created_at" in cols else "id"
+    rows_ = db().query(
+        f"SELECT id, {label} AS label, {_PRECISE_DISP[table]} AS disp FROM {table}{where} "
+        f"ORDER BY {order} LIMIT %s OFFSET %s", params + [lim, off])
+    out = [f"PRECISE {table}", f"hits: {total} (showing {len(rows_)} from offset {off})",
+           "id | label | summary"]
+    for r in rows_:
+        out.append(f"{r['id']} | {r['label'] or ''} | {_clip(r['disp'])}")
+    return "\n".join(out)
+
+
 @mcp.tool
 def lookup(
     tables: list[str] | None = None,
@@ -371,6 +513,10 @@ def lookup(
     groups_exclude: list[str] | None = None,
     outline_page: str | None = None,
     scores: bool = False,
+    filters: list[dict] | None = None,
+    count: bool = False,
+    limit: int = 50,
+    offset: int = 0,
 ) -> str:
     """Hybrid search over Kovault. Returns a ranked CHUNKS index and (when headers are
     searched) a PAGES index to fetch from.
@@ -385,7 +531,13 @@ def lookup(
         so you can pick the right chunk in a large page.
     scores: default off — only the fused rrf score is shown. Set true to also print the
         per-signal vec/kw/graph columns (debugging ranking); costs ~3 extra columns per row.
+    filters: PRECISE mode — exact/deterministic filtering instead of ranked search. A list of
+        {column, op, value} (op in =,!=,>,<,>=,<=,ilike,in) over the FIRST table in `tables`
+        (pages/headers/tasks/decisions/sources/groups). count=true returns just the total;
+        limit/offset paginate deterministically. For audits/aggregates the ranked search can't do.
     """
+    if filters is not None:
+        return _precise_lookup((tables or ["tasks"]), filters, count, limit, offset)
     tables = [t for t in (tables or ["headers"]) if t in _SEARCH]
     include = include or []
     exclude = exclude or []
@@ -409,6 +561,7 @@ def lookup(
     inc_bm = _bm25_terms(include)
     exc_bm = _bm25_terms(exclude)
     qvec = _embedder().embed(" ".join(include)) if include else None
+    qnorm = se.normalize_term(" ".join(include)) if include else ""   # F2 trigram query form
     graph = _graph_points(include, exclude)
 
     inc_groups = _group_entity_sets(groups_include or [])
@@ -420,8 +573,12 @@ def lookup(
         kind = _SEARCH[table]["kind"]
         vhits = _vector_hits(table, qvec) if qvec else {}
         khits = _keyword_hits(table, inc_bm, exc_bm)
-        for cid in set(vhits) | set(khits):
-            base = vhits.get(cid) or khits.get(cid)
+        try:
+            thits = _trigram_hits(table, qnorm) if qnorm else {}
+        except Exception:                          # a pre-migration DB lacks *_norm cols — degrade, don't break search
+            thits = {}
+        for cid in set(vhits) | set(khits) | set(thits):
+            base = vhits.get(cid) or khits.get(cid) or thits.get(cid)
             page_id = base.get("page_id")
             group_entity = page_id if kind == "header" else cid
             if inc_groups and group_entity not in inc_groups:
@@ -433,6 +590,7 @@ def lookup(
                 "title": base.get("title"), "disp": base.get("disp"),
                 "vector": vhits.get(cid, {}).get("vector"),
                 "keyword": khits.get(cid, {}).get("keyword"),
+                "trigram": thits.get(cid, {}).get("trigram"),
                 "graph": graph.get((kind, cid), 0),
             }
 
@@ -442,7 +600,8 @@ def lookup(
     vmap = se.dense_ranks((c["id"], c["vector"]) for c in cand.values() if c["vector"] is not None)
     kmap = se.dense_ranks((c["id"], c["keyword"]) for c in cand.values() if c["keyword"] is not None)
     gmap = se.dense_ranks((c["id"], c["graph"]) for c in cand.values() if c["graph"] > 0)
-    rrf = se.rrf_fuse([vmap, kmap, gmap], k)   # dense-rank ties: equal graph scores share a rank
+    tmap = se.dense_ranks((c["id"], c["trigram"]) for c in cand.values() if c.get("trigram") is not None)
+    rrf = se.rrf_fuse([vmap, kmap, gmap, tmap], k)   # 4th arm: trigram surface-form (F2); dense-rank ties
     for cid, score in rrf.items():
         cand[cid]["rrf"] = score
     ranked = [(cid, cand[cid].get("rrf", 0.0)) for cid, _ in se.order_by_score(
@@ -450,7 +609,7 @@ def lookup(
     lc = settings["ladder_chunks"]
     kept = se.apply_ladder(ranked, lc["r"], int(lc["floor"]), int(lc["cap"]))
 
-    sig = " | vec | kw | graph" if scores else ""
+    sig = " | vec | kw | graph | trg" if scores else ""
     out = ["CHUNKS", f"kind | id | title | blurb/summary | freshness{sig} | rrf"]
     fresh = _page_freshness_map([cand[cid]["page_id"] for cid, _ in kept if cand[cid]["page_id"]])
     for cid, score in kept:
@@ -458,7 +617,7 @@ def lookup(
         f = fresh.get(c["page_id"], "-") if c["kind"] == "header" else "-"
         cols = [c["kind"], c["id"], c["title"] or "(intro)", _clip(c["disp"]), f]
         if scores:
-            cols += [_fmt(c["vector"]), _fmt(c["keyword"]), str(c["graph"])]
+            cols += [_fmt(c["vector"]), _fmt(c["keyword"]), str(c["graph"]), _fmt(c.get("trigram"))]
         cols.append(_fmt(score))
         out.append(" | ".join(cols))
 
@@ -466,6 +625,7 @@ def lookup(
     if "headers" in tables:
         out += _pages_index(
             [c for c in cand.values() if c["kind"] == "header"], k, settings, scores)
+    out.append(f"\nhits: {len(cand)}")            # total candidates before the cutoff ladder (F3)
     return "\n".join(out)
 
 
@@ -498,6 +658,7 @@ def _pages_index(header_cands: list[dict], k: int, settings: dict, scores: bool 
     by_page_v: dict[str, list[float]] = {}
     by_page_k: dict[str, list[float]] = {}
     by_page_g: dict[str, list[float]] = {}
+    top_by_page: dict[str, dict] = {}        # best-matching chunk per page (F1: PAGES snippet)
     for c in header_cands:
         pid = c["page_id"]
         if not pid:
@@ -505,6 +666,8 @@ def _pages_index(header_cands: list[dict], k: int, settings: dict, scores: bool 
         by_page_v.setdefault(pid, []).append(c["vector"] or 0.0)
         by_page_k.setdefault(pid, []).append(c["keyword"] or 0.0)
         by_page_g.setdefault(pid, []).append(float(c["graph"]))
+        if pid not in top_by_page or (c.get("rrf") or 0.0) > (top_by_page[pid].get("rrf") or 0.0):
+            top_by_page[pid] = c
     page_ids = list({c["page_id"] for c in header_cands if c["page_id"]})
     live = {str(r["id"]): int(r["n"]) for r in db().query(
         "SELECT page_id AS id, count(*) AS n FROM headers "
@@ -523,13 +686,16 @@ def _pages_index(header_cands: list[dict], k: int, settings: dict, scores: bool 
         "SELECT id, title, summary, freshness FROM pages WHERE id = ANY(%s)",
         ([pid for pid, _ in kept],))} if kept else {}
     sig = " | vec | kw | graph" if scores else ""
-    lines = ["", "PAGES", f"id | title | summary | freshness{sig} | rrf"]
+    lines = ["", "PAGES", f"id | title | summary | freshness{sig} | rrf | top chunk"]
     for pid, score in kept:
         m = meta.get(pid, {})
         cols = [pid, m.get("title", ""), _clip(m.get("summary")), m.get("freshness", "-")]
         if scores:
             cols += [_fmt(v.get(pid)), _fmt(kk.get(pid)), _fmt(g.get(pid))]
         cols.append(_fmt(score))
+        tc = top_by_page.get(pid)
+        snippet = f"{tc['title']} — {tc['disp']}" if tc and tc.get("title") else (tc.get("disp") if tc else "")
+        cols.append(_clip(snippet))
         lines.append(" | ".join(cols))
     return lines
 
@@ -544,6 +710,20 @@ def _links_of(kind: str, rid: str) -> list[tuple[str, str]]:
         (kind, rid))]
 
 
+def _full_id(table: str, rid: str):
+    """Resolve a partial id (a unique prefix) to the full uuid (F3); a full 36-char id passes through.
+    Returns (id, error) — an ambiguous or missing prefix errors rather than guessing."""
+    s = str(rid or "")
+    if not s or len(s) >= 36:
+        return rid, None
+    rows = db().query(f"SELECT id FROM {table} WHERE id::text LIKE %s LIMIT 5", (s + "%",))
+    if len(rows) == 1:
+        return str(rows[0]["id"]), None
+    if not rows:
+        return None, f"({table[:-1]} id starting '{s}' not found)"
+    return None, f"(ambiguous {table[:-1]} id prefix '{s}': {len(rows)} matches)"
+
+
 @mcp.tool
 def fetch(
     pages: list[str] | None = None,
@@ -552,23 +732,47 @@ def fetch(
     decisions: list[str] | None = None,
     sources: list[str] | None = None,
     groups: list[str] | None = None,
+    outline: bool = False,
 ) -> str:
     """Render full entities by id: whole pages, single chunks (headers), tasks, decisions,
     sources, or groups. Fetch a page/chunk before editing it. Explicit ids can reach trashed
-    rows (recovery/history)."""
+    rows (recovery/history).
+
+    outline: for `pages`, return a cheap chunk index (index | id | title | blurb) instead of the
+    whole page — pick the one chunk you need, and get its id for a `write` (a full page fetch has no chunk ids)."""
     parts: list[str] = []
     for pid in pages or []:
+        pid, err = _full_id("pages", pid)
+        if err:
+            parts.append(err)
+            continue
         page = db().query_one("SELECT * FROM pages WHERE id=%s", (pid,))
         if not page:
             parts.append(f"(page {pid} not found)")
+            continue
+        if outline:
+            hs = db().query(
+                "SELECT id, index, title, blurb FROM headers WHERE page_id=%s AND trashed_at IS NULL "
+                "ORDER BY index", (pid,))
+            lines = [f"PAGE OUTLINE {page.get('title') or ''} ({pid})", "index | id | title | blurb"]
+            lines += [f"{r['index']} | {r['id']} | {r['title'] or '(intro)'} | {r['blurb'] or ''}" for r in hs]
+            parts.append("\n".join(lines))
             continue
         hs = db().query(
             "SELECT * FROM headers WHERE page_id=%s AND trashed_at IS NULL ORDER BY index", (pid,))
         parts.append(rnd.render_page(page, hs))     # inline body links carry navigation; no links query
     for hid in headers or []:
+        hid, err = _full_id("headers", hid)
+        if err:
+            parts.append(err)
+            continue
         h = db().query_one("SELECT * FROM headers WHERE id=%s", (hid,))
         parts.append(rnd.render_chunk(h) if h else f"(chunk {hid} not found)")
     for tid in tasks or []:
+        tid, err = _full_id("tasks", tid)
+        if err:
+            parts.append(err)
+            continue
         t = db().query_one("SELECT * FROM tasks WHERE id=%s", (tid,))
         if not t:
             parts.append(f"(task {tid} not found)")
@@ -578,9 +782,17 @@ def fetch(
             "WHERE d.dependent=%s", (tid,))]
         parts.append(rnd.render_task(t, blockers, _links_of("task", tid)))
     for did in decisions or []:
+        did, err = _full_id("decisions", did)
+        if err:
+            parts.append(err)
+            continue
         d = db().query_one("SELECT * FROM decisions WHERE id=%s", (did,))
         parts.append(rnd.render_decision(d, _links_of("decision", did)) if d else f"(decision {did} not found)")
     for sid in sources or []:
+        sid, err = _full_id("sources", sid)
+        if err:
+            parts.append(err)
+            continue
         s = db().query_one("SELECT * FROM sources WHERE id=%s", (sid,))
         if not s:
             parts.append(f"(source {sid} not found)")
@@ -589,13 +801,25 @@ def fetch(
             "SELECT header_id FROM header_sources WHERE source_id=%s", (sid,))]
         parts.append(rnd.render_source(s, ref_by))
     for gid in groups or []:
+        gid, err = _full_id("groups", gid)
+        if err:
+            parts.append(err)
+            continue
         g = db().query_one("SELECT * FROM groups WHERE id=%s", (gid,))
         if not g:
             parts.append(f"(group {gid} not found)")
             continue
         members = _group_members(gid)
-        parts.append(rnd.render_group(g, members))
+        ids_only = len(members) > _GROUP_IDS_ONLY_MAX      # big rosters render ids-only (F1)
+        rendered = rnd.render_group(g, members, ids_only=ids_only)
+        if ids_only:
+            rendered += (f"\n({len(members)} members, ids only — fetch each id, or use the "
+                         f"`group` tool / snippet for labels)\n")
+        parts.append(rendered)
     return "\n".join(parts) if parts else "(nothing requested)"
+
+
+_GROUP_IDS_ONLY_MAX = 25     # a roster larger than this renders ids-only by default
 
 
 def _group_members(gid: str) -> list[tuple[str, str, str]]:
@@ -666,8 +890,9 @@ def _snippet_freshness(table: str, rid: str) -> str | None:
 def rows(table: str, where: list[dict] | None = None, limit: int = 50) -> str:
     """Backup path: raw read of ANY table (incl. edits / janitor_reports). Read-only, op
     whitelist (= != > < >= <= ilike in), hard limit cap. Every call is logged so future tool
-    upgrades can learn where the main tools fell short. Use only when fetch/snippet/lookup
-    are insufficient — the goal stays: never write SQL."""
+    upgrades can learn where the main tools fell short. For exact filters/counts on the main
+    entities prefer `lookup(filters=[...], count=...)` (precise mode); use `rows` only for tables
+    lookup can't reach (edits / janitor_reports / settings / debug_log). Never write SQL."""
     cols = _cols(table)
     if not cols:
         return f"(unknown table {table})"
@@ -762,18 +987,20 @@ def _insert_one(cur, table: str, fields: dict, user: str, actor: str) -> tuple[s
     elif table == "headers":
         new_id = _insert_header(cur, fields)
         warnings += _sync_links(cur, "header", new_id, fields.get("body"), "headers", "body")
-        _embed_and_set(cur, "headers", new_id)
+        # embedding is deferred: the row acks now with embedded_at NULL; the embed worker drains it (F6)
         for sid in fields.get("source_ids") or []:
             cur.execute("INSERT INTO header_sources (header_id, source_id) VALUES (%s,%s) "
                         "ON CONFLICT DO NOTHING", (new_id, sid))
         _touch_contributors(cur, page_id=fields.get("page_id"), user=user)
     else:
         kind = SUBTYPE_KIND[table]
+        if table == "tasks" and not fields.get("responsible"):
+            fields["responsible"] = [user]        # default owner to the committing user (F4)
         new_id = _new_entity(cur, kind)
         _insert_subtype(cur, table, new_id, fields)
         text_field = "summary" if table == "sources" else "description"
         warnings += _sync_links(cur, kind, new_id, fields.get(text_field), table, text_field)
-        _embed_and_set(cur, table, new_id)
+        # embedding deferred to the worker (F6) — row acks now with embedded_at NULL
     log_edit(cur, table_name=table, row_id=new_id, operation="insert",
              edited_by=user, actor=actor, changes=fields)
     return new_id, warnings
@@ -781,7 +1008,8 @@ def _insert_one(cur, table: str, fields: dict, user: str, actor: str) -> tuple[s
 
 @mcp.tool
 def insert(table: str, fields: dict | None = None, rows: list[dict] | None = None) -> str:
-    """Create a page / header / task / decision / source. The server creates the entity row,
+    """Deprecated — prefer the unified `write` tool (kept this release for compatibility).
+    Create a page / header / task / decision / source. The server creates the entity row,
     embeds from the row's fields, parses markdown links into the graph, and logs an edit.
     edited_by/actor are stamped from the session — do not set them. For groups use `group`; for
     junction rows use `link`.
@@ -877,10 +1105,12 @@ def _insert_subtype(cur, table: str, new_id: str, f: dict) -> None:
             (new_id, f.get("type"), f.get("title"), f.get("reference"), f.get("sha256"),
              f.get("summary")))
     elif table == "tasks":
+        # priority/scope are nullable (F4): an unset field stays NULL, distinct from a deliberate
+        # choice — no silent 'medium'/'minutes' default. status keeps its 'todo' default.
         cur.execute(
             "INSERT INTO tasks (id, title, description, status, priority, scope, deadline, responsible) "
-            "VALUES (%s,%s,%s, coalesce(%s,'todo')::task_status, coalesce(%s,'medium')::task_priority, "
-            "coalesce(%s,'minutes')::task_scope, %s, %s)",
+            "VALUES (%s,%s,%s, coalesce(%s,'todo')::task_status, %s::task_priority, "
+            "%s::task_scope, %s, %s)",
             (new_id, f.get("title"), f.get("description"), f.get("status"), f.get("priority"),
              f.get("scope"), f.get("deadline"), f.get("responsible")))
     elif table == "decisions":
@@ -942,8 +1172,8 @@ def _update_one(cur, table: str, rid: str, set_fields: dict, user: str, actor: s
                   "decisions": "description", "sources": "summary"}.get(table)
     if text_field and text_field in fieldset:
         warnings += _sync_links(cur, SUBTYPE_KIND.get(table, "header"), rid, row.get(text_field), table, text_field)
-    if table in et.COMPOSERS and _embedded_field_changed(table, fieldset):
-        _embed_and_set(cur, table, rid)
+    # embedding deferred: updated_at bumps past embedded_at, so the worker re-embeds this row (F6).
+    # (_embedded_field_changed / _embed_and_set stay for janitor -embed, the manual backstop.)
     if table == "pages":
         _touch_contributors(cur, page_id=rid, user=user)
     elif table == "headers":
@@ -955,7 +1185,8 @@ def _update_one(cur, table: str, rid: str, set_fields: dict, user: str, actor: s
 @mcp.tool
 def update(table: str, id: str | None = None, set: dict | None = None,
            updates: list[dict] | None = None) -> str:
-    """Edit fields on an existing row. Re-embeds if an embedded field changed; re-parses links if a
+    """Deprecated — prefer the unified `write` tool (kept this release for compatibility).
+    Edit fields on an existing row. Re-embeds if an embedded field changed; re-parses links if a
     text field changed; appends you to the page's contributors; logs an edit. Page-title rename
     rebuilds header paths and marks that page's chunks stale for /janitor -embed. Set
     freshness=static (never-stale reference) or archived (superseded) here.
@@ -1011,7 +1242,8 @@ def _rename_cascade(cur, page_id: str, new_title: str) -> None:
 
 @mcp.tool
 def delete(table: str, ids: list[str]) -> str:
-    """Trash rows (nothing is ever hard-deleted). Pages -> freshness='trashed';
+    """Deprecated — prefer the unified `write` tool with `trashed: true` (kept this release).
+    Trash rows (nothing is ever hard-deleted). Pages -> freshness='trashed';
     headers/tasks/decisions/sources -> trashed_at=now(). Logs an edit (operation='trash').
     Trashed rows drop out of lookup/snippet but stay fetchable by id. Recover with update."""
     user, actor = _identity()
@@ -1043,7 +1275,9 @@ def delete(table: str, ids: list[str]) -> str:
 
 @mcp.tool
 def link(action: str, table: str, fields: dict | list[dict]) -> str:
-    """Manual repair for auto-linking. action: add|remove. table: links | header_sources |
+    """Prefer `write` for entity links (markdown/[[wikilinks]] in a body). Still the path for
+    junction rows write does not cover: task_dependencies, header_sources, group_links.
+    Manual repair for auto-linking. action: add|remove. table: links | header_sources |
     task_dependencies | group_links. fields carries that table's columns (e.g. task_dependencies:
     blocker, dependent; links: from_kind, from_id, to_kind, to_id). Pass a LIST of field dicts to
     add/remove many junction rows in one transaction (the relinker path)."""
@@ -1093,7 +1327,8 @@ def group(
     set: dict | None = None,
     filter_name: str | None = None,
 ) -> str:
-    """Flexible categories over entities (projects/topics/areas). action:
+    """Prefer `write` (a `type: group` block) for group ROW create/update; this tool still handles
+    membership (add/remove) and list. Flexible categories over entities (projects/topics/areas). action:
     create (name,type,description,participants) | update (id,set) | add (id,members) |
     remove (id,members) | list ([type],[filter_name]). Membership is entity ids (pages/tasks/
     decisions/sources). Groups are filterable in lookup and render via fetch/snippet."""
@@ -1146,6 +1381,137 @@ def group(
                for r in db().query(sql, params)]
         return "\n".join(out) if out else "(no groups)"
     return "(unknown group action)"
+
+
+# =======================================================================================
+# write — one template-upsert tool over the write path (folds insert/update/delete/link/group)
+# =======================================================================================
+
+def _row_live(cur, table: str, rid: str) -> bool:
+    live = "freshness <> 'trashed'" if table == "pages" else "trashed_at IS NULL"
+    cur.execute(f"SELECT 1 FROM {table} WHERE id=%s AND {live}", (rid,))
+    return cur.fetchone() is not None
+
+
+def _same(cur_val, new_val) -> bool:
+    """Loose equality for the update no-op filter: skip a field whose new value already matches the
+    stored one (avoids a needless re-embed / edit-log row). Errs toward writing when unsure."""
+    if cur_val is None and new_val is None:
+        return True
+    return str(cur_val) == str(new_val)
+
+
+def _drop_unchanged(cur, table: str, rid: str, upd: dict) -> dict:
+    cur.execute(f"SELECT * FROM {table} WHERE id=%s", (rid,))
+    cur_row = dict(cur.fetchone() or {})
+    return {k: v for k, v in upd.items() if not (k in cur_row and _same(cur_row[k], v))}
+
+
+def _trash_one(cur, table: str, rid: str, user: str, actor: str) -> str:
+    cur.execute(f"SELECT * FROM {table} WHERE id=%s", (rid,))
+    row = cur.fetchone()
+    if not row:
+        return f"(error: {table} id {rid} not found)"
+    if table == "pages":
+        cur.execute("UPDATE pages SET freshness='trashed' WHERE id=%s", (rid,))
+    else:
+        cur.execute(f"UPDATE {table} SET trashed_at=now() WHERE id=%s", (rid,))
+    log_edit(cur, table_name=table, row_id=rid, operation="trash", edited_by=user, actor=actor)
+    return f"trashed {table} {_write_label(dict(row))} ({rid})"
+
+
+def _write_group(cur, rid: str | None, fields: dict, trashed: bool) -> str:
+    """Group ROW create/update from a `type: group` block. Membership + listing stay on the
+    `group` tool (a rendered member roster is labels, not a clean id set to reconcile from)."""
+    if trashed:
+        return "(groups are not trashable via write — use the group tool)"
+    s = {k: v for k, v in fields.items() if k in {"name", "type", "description", "participants"}}
+    _, err = _check_enums("groups", s)
+    if err:
+        return f"(error: {err})"
+    if rid:
+        cur.execute("SELECT 1 FROM groups WHERE id=%s", (rid,))
+        if not cur.fetchone():
+            return f"(error: group id {rid} not found — omit id to create)"
+        if not s:
+            return f"(no change: group {rid})"
+        cur.execute(f"UPDATE groups SET {', '.join(f'{k}=%s' for k in s)} WHERE id=%s",
+                    list(s.values()) + [rid])
+        return f"updated group {rid}"
+    if not s.get("name"):
+        return "(error: a new group needs a name)"
+    cur.execute("INSERT INTO groups (name, type, description, participants) VALUES (%s,%s,%s,%s) RETURNING id",
+                (s.get("name"), s.get("type"), s.get("description"), s.get("participants")))
+    return f'inserted group "{s.get("name")}" ({str(cur.fetchone()["id"])})'
+
+
+def _warns(ws: list[str]) -> str:
+    return ("\n  " + "\n  ".join(ws)) if ws else ""
+
+
+def _dispatch_block(cur, p: dict, user: str, actor: str) -> str:
+    table, kind, rid, fields = p["table"], p["kind"], p["id"], p["fields"]
+    if kind == "group":
+        return _write_group(cur, rid, fields, p["trashed"])
+    if p["trashed"]:
+        return _trash_one(cur, table, rid, user, actor) if rid else f"(skip: trash needs an id — {kind})"
+    notes, err = _check_enums(table, fields)          # validate/normalize enum values (F5)
+    if err:
+        return f"(error: {err})"
+    tag = ("  [" + "; ".join(notes) + "]") if notes else ""
+    if rid:
+        if not _row_live(cur, table, rid):
+            return f"(error: {kind} id {rid} not found — no update; omit id to insert a new row)"
+        upd = dict(fields)
+        if kind == "header":                      # moving a chunk (page_id/index) is out of scope
+            for k in ("page_id", "index"):
+                upd.pop(k, None)
+        upd = _drop_unchanged(cur, table, rid, upd)
+        if not upd:
+            return f"(no change: {table} {rid})"
+        res = _update_one(cur, table, rid, upd, user, actor)
+        return (f"updated {table} {res[0]} ({rid}){tag}" + _warns(res[1])) if res else f"(error: update failed {rid})"
+    ins = {k: v for k, v in fields.items() if v is not None}   # let DB defaults/NULL apply on insert
+    if kind == "header" and not ins.get("page_id"):
+        return "(error: a header block needs page_id to insert — get it from fetch outline)"
+    nid, warns = _insert_one(cur, table, ins, user, actor)
+    return f"inserted {table} {_write_label(ins)} ({nid}){tag}" + _warns(warns)
+
+
+@mcp.tool
+def write(blocks: list[str]) -> str:
+    """Create or update entities from template blocks — the single write path.
+
+    Each element of `blocks` is ONE `---`-fenced frontmatter template, the SAME shape `fetch`
+    returns, so you write what you read. `blocks` is a LIST (batch = several templates, one
+    transaction); pass one element for a single write.
+
+    - `type:` marks the kind — task / decision / source / group / header; anything else is a PAGE
+      (whose `type:` is its free OKF page type, e.g. note/report). A chunk is `type: header` with
+      `page_id`, `index`, `title`, `blurb` in the frontmatter, then the body AFTER the closing `---`.
+    - `id:` present and live → UPDATE that row: only the fields you include change; an omitted field
+      is left unchanged, an explicitly empty field is cleared. `id:` absent → INSERT. An `id:` that
+      matches no live row is an ERROR (never a silent duplicate).
+    - Trash a row with `trashed: true` (or `freshness: trashed` on a page).
+    - Chunk ids come from `fetch(outline=true)` / `lookup(outline_page=…)` — a whole-page fetch
+      does not show them. Links: `[text](kind:uuid)` / `[[wikilinks]]` in the body/description as
+      before. Group membership and task blockers still use the `group` / `link` tools.
+    """
+    user, actor = _identity()
+    parsed, lines = [], []
+    for i, b in enumerate(blocks or []):
+        try:
+            parsed.append(bl.parse_block(b))
+        except bl.BlockError as e:
+            lines.append(f"(error: block {i}: {e})")
+    if not parsed:
+        return "\n".join(lines) or "(nothing to write)"
+    with db().connection() as conn:
+        with conn.cursor() as cur:
+            for p in parsed:
+                lines.append(_dispatch_block(cur, p, user, actor))
+        conn.commit()
+    return "\n".join(lines)
 
 
 # =======================================================================================
@@ -1261,8 +1627,25 @@ def _janitor_diagnose() -> dict:
         " SELECT 1 FROM headers h WHERE l.to_kind='header' AND h.id=l.to_id AND h.trashed_at IS NULL)"
         " AND l.to_kind='header'")["n"])
     redundant = int(q(f"SELECT count(*) n FROM ({_REDUNDANT_DEPS_SQL}) x")["n"])
+    # near-duplicate groups (F7): normalized-name collisions + pairs sharing >=3 members. Report
+    # only — never auto-merge, since a real distinction (e.g. two same-named servers) may be intended.
+    dup_group_names = int(q(
+        "SELECT count(*) n FROM (SELECT lower(regexp_replace(name,'[^a-zA-Z0-9]','','g')) k "
+        "FROM groups GROUP BY 1 HAVING count(*) > 1) x")["n"])
+    overlapping_groups = int(q(
+        "SELECT count(*) n FROM (SELECT a.group_id FROM group_links a "
+        "JOIN group_links b ON a.entity_id=b.entity_id AND a.group_id < b.group_id "
+        "GROUP BY a.group_id, b.group_id HAVING count(*) >= 3) x")["n"])
+    # orphan tasks (F4): live tasks with no graph link and no dependency edge — hard to find/trust.
+    orphan_tasks = int(q(
+        "SELECT count(*) n FROM tasks t WHERE t.trashed_at IS NULL "
+        "AND NOT EXISTS (SELECT 1 FROM links l WHERE (l.from_kind='task' AND l.from_id=t.id) "
+        "                                          OR (l.to_kind='task' AND l.to_id=t.id)) "
+        "AND NOT EXISTS (SELECT 1 FROM task_dependencies d WHERE d.blocker=t.id OR d.dependent=t.id)")["n"])
     return {"stale_embeddings": stale, "trashed_pages": trashed,
-            "dangling_header_links": dangling, "redundant_blocks": redundant}
+            "dangling_header_links": dangling, "redundant_blocks": redundant,
+            "duplicate_group_names": dup_group_names, "overlapping_groups": overlapping_groups,
+            "orphan_tasks": orphan_tasks}
 
 
 def _janitor_freshness(cur, user: str) -> int:
@@ -1458,6 +1841,26 @@ async def relocate_sources(request: Request):
         return n
 
     return JSONResponse({"updated": await run_in_threadpool(_do)})
+
+
+# =======================================================================================
+# page-meta  (cheap freshness probe — the fetch-dedup PreToolUse hook checks updated_at, F1)
+# =======================================================================================
+
+@mcp.custom_route("/page-meta", methods=["GET"])
+async def page_meta(request: Request):
+    """Return {page_id: updated_at_iso} for the given ids. The dedup hook calls this to decide
+    whether a page changed since it was last fetched this session (edited -> allow a re-fetch)."""
+    ids = [i.strip() for i in (request.query_params.get("ids") or "").split(",") if i.strip()]
+    ids = [i for i in ids if _looks_uuid(i)]     # ignore non-uuid input rather than error on the cast
+    if not ids:
+        return JSONResponse({})
+
+    def _q() -> dict:
+        return {str(r["id"]): (r["updated_at"].isoformat() if r["updated_at"] else "")
+                for r in db().query("SELECT id, updated_at FROM pages WHERE id = ANY(%s)", (ids,))}
+
+    return JSONResponse(await run_in_threadpool(_q))
 
 
 # =======================================================================================

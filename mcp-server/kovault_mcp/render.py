@@ -87,6 +87,7 @@ def render_task(t: dict, blockers: list[str] | None = None, links: list[tuple[st
         f"priority: {t.get('priority') or ''}",
         f"scope: {t.get('scope') or ''}",
         f"deadline: {_ts(t.get('deadline'))}",
+        f"completed: {_ts(t.get('completed_at'))}",
         f"responsible: {_q(_list(t.get('responsible')))}",
         f"blockers: {_q(_list(blockers))}",
         f"related: {_q(_related(links))}",
@@ -127,9 +128,14 @@ def render_source(s: dict, referenced_by: list[str] | None = None) -> str:
     ]) + "\n"
 
 
-def render_group(g: dict, members: list[tuple[str, str, str]] | None = None) -> str:
-    """members = [(entity_kind, id, title/name), ...] from group_links via snippet data."""
-    member_str = ", ".join(f"{k}: {i} — {label}" for k, i, label in (members or []))
+def render_group(g: dict, members: list[tuple[str, str, str]] | None = None,
+                 ids_only: bool = False) -> str:
+    """members = [(entity_kind, id, title/name), ...] from group_links via snippet data.
+    ids_only drops the ` — label` (a large roster's labels cost tokens; fetch ids for detail)."""
+    if ids_only:
+        member_str = ", ".join(f"{k}: {i}" for k, i, _ in (members or []))
+    else:
+        member_str = ", ".join(f"{k}: {i} — {label}" for k, i, label in (members or []))
     return "\n".join([
         "---",
         "type: group",

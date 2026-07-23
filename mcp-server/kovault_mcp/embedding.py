@@ -33,6 +33,17 @@ class EmbeddingClient:
         resp.raise_for_status()
         return resp.json()["data"][0]["embedding"]
 
+    def _raw_many(self, texts: list[str]) -> list[list[float]]:
+        """Embed a whole batch in ONE request. The OpenAI wire format returns a `data` list with a
+        per-item `index`; sort by it rather than trusting positional order."""
+        resp = self._client.post(
+            f"{self.endpoint}/v1/embeddings",
+            json={"input": texts, "model": self.model},
+        )
+        resp.raise_for_status()
+        data = sorted(resp.json()["data"], key=lambda d: d.get("index", 0))
+        return [d["embedding"] for d in data]
+
     @staticmethod
     def _mrl_normalise(vec: list[float], dims: int) -> list[float]:
         """MRL-truncate to `dims`, then L2-normalise (cosine-friendly)."""
@@ -44,3 +55,9 @@ class EmbeddingClient:
         """Return a pgvector literal '[a,b,c]' truncated/normalised to `dims`."""
         vec = self._mrl_normalise(self._raw(text), self.dims)
         return "[" + ",".join(repr(x) for x in vec) + "]"
+
+    def embed_many(self, texts: list[str]) -> list[str]:
+        """Batch variant of embed() — one endpoint round-trip for the whole list, results aligned
+        to the input order. Used by the background embed worker."""
+        return ["[" + ",".join(repr(x) for x in self._mrl_normalise(v, self.dims)) + "]"
+                for v in self._raw_many(texts)]

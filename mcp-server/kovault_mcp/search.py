@@ -10,7 +10,19 @@ is executed by the server (db.py), not this module.
 from __future__ import annotations
 
 import math
+import re
+import unicodedata
 from collections import defaultdict
+
+
+def normalize_term(s: str | None) -> str:
+    r"""Normalize a title/query for the trigram arm (F2): strip diacritics, drop hyphens/whitespace,
+    lowercase. Mirrors the SQL generated column
+    `lower(f_unaccent(regexp_replace(col,'[-\s]+','','g')))` so a query term matches the stored
+    normalized form (E-drawing / e drawing / Edrawing -> edrawing; Emp-Viewer -> empviewer)."""
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"[-\s]+", "", s).lower()
 
 # ---------------------------------------------------------------------------------------
 # RRF fusion

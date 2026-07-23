@@ -5,4 +5,4 @@ plus janitor) as MCP tools over an HTTP endpoint. The model never writes SQL; it
 tool inputs and the server does the heavy lifting (embedding, RRF, link parsing, edits log).
 """
 
-__version__ = "1.0.0"
+__version__ = "1.3.0"

@@ -21,6 +21,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "freshness_days": {"hot": 30, "warm": 90},
     "freshness_auto": {"enabled": True, "cooldown_seconds": 3600},
     "embedding": {"model": "Qwen3-Embedding-8B", "endpoint": "http://embedding:8080", "dims": 4000},
+    "embed_worker": {"enabled": True, "poll_seconds": 3, "batch": 32, "max_retries": 3},
 }
 
 

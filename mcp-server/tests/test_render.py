@@ -11,7 +11,7 @@ class TestRender(unittest.TestCase):
     def test_page_frontmatter_and_lean_chunks(self):
         page = {"id": U, "title": "Deploy", "summary": "how to deploy", "type": "runbook",
                 "created_at": datetime(2026, 1, 1), "updated_at": datetime(2026, 2, 1),
-                "freshness": "hot", "contributors": ["carlo", "ana"]}
+                "freshness": "hot", "contributors": ["alice", "bob"]}
         headers = [
             {"id": "h1", "title": "(intro)", "blurb": "overview", "body": "text",
              "updated_at": datetime(2026, 2, 1), "index": 0},
@@ -22,7 +22,7 @@ class TestRender(unittest.TestCase):
         out = r.render_page(page, headers)
         self.assertIn("type: runbook", out)              # page frontmatter kept
         self.assertIn(f"id: {U}", out)
-        self.assertIn("contributors: carlo, ana", out)
+        self.assertIn("contributors: alice, bob", out)
         self.assertIn("Steps", out)                      # chunk title kept
         self.assertIn(f"[deploy task](task:{U})", out)   # inline link preserved verbatim in body
         # lean chunks: no per-chunk callout / summary / related / header id
@@ -52,7 +52,7 @@ class TestRender(unittest.TestCase):
     def test_task_frontmatter(self):
         t = {"id": U, "title": "ship", "description": "d", "status": "todo", "priority": "high",
              "scope": "days", "created_at": None, "updated_at": None, "deadline": None,
-             "responsible": ["carlo"]}
+             "responsible": ["alice"]}
         out = r.render_task(t, blockers=["design"], links=[("decision", U)])
         self.assertIn("type: task", out)
         self.assertIn("blockers: design", out)
@@ -63,7 +63,7 @@ class TestRender(unittest.TestCase):
              "created_at": None, "updated_at": None, "sha256": "abc"}
         self.assertIn("sourcetype: file", r.render_source(s, ["h1"]))
         g = {"id": U, "type": "project", "name": "Migration", "description": "d",
-             "participants": ["carlo"]}
+             "participants": ["alice"]}
         out = r.render_group(g, [("page", U, "Deploy")])
         self.assertIn("grouptype: project", out)
         # members line holds ': ' (colon-space) so it must be quoted or the YAML block breaks
@@ -73,7 +73,7 @@ class TestRender(unittest.TestCase):
         # a title/description with ': ' must be quoted so Obsidian doesn't read the tail as a nested key
         t = {"id": U, "title": "Plan: beat the old", "description": "two gaps: (1) a, (2) b",
              "status": "todo", "priority": "low", "scope": "days",
-             "created_at": None, "updated_at": None, "deadline": None, "responsible": ["carlo"]}
+             "created_at": None, "updated_at": None, "deadline": None, "responsible": ["alice"]}
         out = r.render_task(t)
         self.assertIn('title: "Plan: beat the old"', out)
         self.assertIn('description: "two gaps: (1) a, (2) b"', out)

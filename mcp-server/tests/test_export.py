@@ -77,7 +77,7 @@ class TestBundleLayout(unittest.TestCase):
                        "updated_at": None, "deadline": None, "responsible": []}],
             "decisions": [{"id": U, "title": "Pick Y", "description": "d",
                            "decided_at": datetime(2026, 7, 6), "created_at": None,
-                           "updated_at": None, "decided_by": "carlo"}],
+                           "updated_at": None, "decided_by": "alice"}],
             "sources": [
                 {"id": U, "title": "My Notes", "type": "file", "reference": "/a/b/notes.md",
                  "summary": "s", "created_at": None, "updated_at": None, "sha256": ""},

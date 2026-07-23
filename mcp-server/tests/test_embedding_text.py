@@ -26,7 +26,7 @@ class TestCompose(unittest.TestCase):
 
     def test_decision_prefix_and_worded_date(self):
         text = et.compose_decision_text({
-            "title": "use CTE", "decided_by": "Carlo",
+            "title": "use CTE", "decided_by": "Alice",
             "decided_at": datetime(2026, 7, 9), "description": "graph engine",
         })
         self.assertTrue(text.startswith("decision:"))

@@ -13,7 +13,13 @@
 CREATE EXTENSION IF NOT EXISTS vector;      -- pgvector (halfvec)
 CREATE EXTENSION IF NOT EXISTS pg_search;   -- BM25 full-text (needs shared_preload_libraries, see docker-compose.yml)
 CREATE EXTENSION IF NOT EXISTS pg_trgm;     -- trigram index for the graph anchor ILIKE (perf; stock contrib, bundled in paradedb)
+CREATE EXTENSION IF NOT EXISTS unaccent;    -- accent-folding for the normalized keyword arm (F2)
 -- CREATE EXTENSION IF NOT EXISTS age;      -- graph engine — only if AGE is re-added (BUILD.md B5)
+
+-- IMMUTABLE unaccent wrapper: bare unaccent() is only STABLE, so it cannot be used in a generated
+-- column or expression index. Naming the dictionary explicitly makes it safe to mark IMMUTABLE.
+CREATE OR REPLACE FUNCTION f_unaccent(text) RETURNS text
+  LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$ SELECT unaccent('unaccent', $1) $$;
 
 -- ---------------- Enums ----------------
 CREATE TYPE entity_kind      AS ENUM ('source', 'task', 'page', 'decision');
@@ -62,6 +68,7 @@ CREATE TABLE sources (
   reference         varchar(256) NOT NULL,               -- url, path
   sha256            char(64),                            -- ingest dedupe key
   summary           varchar(512),                        -- re-ingest dates appended here
+  title_norm        text GENERATED ALWAYS AS (lower(f_unaccent(regexp_replace(coalesce(title,''),'[-\s]+','','g')))) STORED,  -- F2 trigram
   summary_embedding halfvec(4000),                       -- embed: composed from row fields (embedding.md)
   embedded_at       timestamptz                          -- < updated_at → stale, /janitor -embed re-embeds
 );
@@ -75,6 +82,7 @@ CREATE TABLE decisions (
   description varchar(1024),
   decided_by  varchar(64),
   decided_at  timestamptz,
+  title_norm  text GENERATED ALWAYS AS (lower(f_unaccent(regexp_replace(coalesce(title,''),'[-\s]+','','g')))) STORED,  -- F2 trigram
   embedding   halfvec(4000),
   embedded_at timestamptz
 );
@@ -99,10 +107,12 @@ CREATE TABLE tasks (
   title       varchar(64)  NOT NULL,
   description varchar(1024),
   status      task_status   NOT NULL DEFAULT 'todo',
-  priority    task_priority NOT NULL DEFAULT 'medium',
-  scope       task_scope    NOT NULL DEFAULT 'minutes',
+  priority    task_priority,                             -- nullable (F4): unset != a deliberate 'medium'
+  scope       task_scope,                                -- nullable (F4): unset != a deliberate 'minutes'
   deadline    timestamptz,
+  completed_at timestamptz,                              -- stamped by trigger when status -> done (F4)
   responsible varchar(64)[],                             -- free names; may name people without Kovault access
+  title_norm  text GENERATED ALWAYS AS (lower(f_unaccent(regexp_replace(coalesce(title,''),'[-\s]+','','g')))) STORED,  -- F2 trigram
   embedding   halfvec(4000),
   embedded_at timestamptz
 );
@@ -137,6 +147,8 @@ CREATE TABLE headers (
   path        varchar(512),                              -- page.title > H1 > H2 > H3
   blurb       varchar(256),
   body        text,                                      -- markdown links in here become graph edges
+  title_norm  text GENERATED ALWAYS AS (lower(f_unaccent(regexp_replace(coalesce(title,''),'[-\s]+','','g')))) STORED,  -- F2 trigram
+  blurb_norm  text GENERATED ALWAYS AS (lower(f_unaccent(regexp_replace(coalesce(blurb,''),'[-\s]+','','g')))) STORED,
   embedding   halfvec(4000),
   embedded_at timestamptz
 );
@@ -212,6 +224,14 @@ CREATE INDEX ON headers   USING hnsw (embedding halfvec_cosine_ops);
 -- graph scoring flat as data grows (measured ~4x at 5.5k chunks).
 CREATE INDEX ON headers USING gin (title gin_trgm_ops);
 
+-- Normalized-title trigram indexes for the fuzzy keyword arm (F2). The `%`/similarity() probes in
+-- _trigram_hits use these; without them each is a seq-scan.
+CREATE INDEX ON headers   USING gin (title_norm gin_trgm_ops);
+CREATE INDEX ON headers   USING gin (blurb_norm gin_trgm_ops);
+CREATE INDEX ON tasks     USING gin (title_norm gin_trgm_ops);
+CREATE INDEX ON decisions USING gin (title_norm gin_trgm_ops);
+CREATE INDEX ON sources   USING gin (title_norm gin_trgm_ops);
+
 -- ---------------- Keyword indexes (pg_search bm25) ----------------
 CREATE INDEX ON headers   USING bm25 (id, title, blurb, body)         WITH (key_field='id');
 CREATE INDEX ON tasks     USING bm25 (id, title, description)         WITH (key_field='id');
@@ -256,3 +276,20 @@ CREATE TRIGGER trg_decisions_updated BEFORE UPDATE ON decisions FOR EACH ROW EXE
 CREATE TRIGGER trg_sources_updated   BEFORE UPDATE ON sources   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 CREATE TRIGGER trg_groups_updated    BEFORE UPDATE ON groups    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 CREATE TRIGGER trg_settings_updated  BEFORE UPDATE ON settings  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- Task completion stamp (F4): set completed_at when a task first reaches 'done'; clear it if the
+-- task is later reopened. Automates the "done on" timestamp without a planned_start/doing sweep.
+CREATE OR REPLACE FUNCTION set_task_completed_at() RETURNS trigger AS $$
+BEGIN
+  IF NEW.status = 'done' AND NEW.completed_at IS NULL
+     AND (TG_OP = 'INSERT' OR OLD.status IS DISTINCT FROM 'done') THEN
+    NEW.completed_at = now();
+  ELSIF TG_OP = 'UPDATE' AND NEW.status <> 'done' AND OLD.status = 'done' THEN
+    NEW.completed_at = NULL;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_tasks_completed BEFORE INSERT OR UPDATE ON tasks
+  FOR EACH ROW EXECUTE FUNCTION set_task_completed_at();
