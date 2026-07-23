@@ -13,10 +13,10 @@ BEGIN;
 ALTER TABLE groups ADD COLUMN IF NOT EXISTS archived_at timestamptz;
 
 -- ---- A2: people normalization backfill ------------------------------------------------
--- Contributors was append-only, so case/variant duplicates baked in (carlo/Carlo,
--- quincy/Quincy/QuincyK). Case-fold (lowercase, matching the write-boundary norm) + dedupe
--- every person-bearing column. Same transform as `janitor -normalize-people`; run once here so
--- the deploy lands clean. Only rewrites rows that actually change.
+-- Contributors was append-only, so case/spelling variants of one person baked in (e.g. alice/Alice,
+-- bob/Bob/BobK). Case-fold (lowercase, matching the write-boundary norm) + dedupe every
+-- person-bearing column. Same transform as `janitor -normalize-people`; run once here so the
+-- deploy lands clean. Only rewrites rows that actually change.
 UPDATE pages t SET contributors = sub.arr
   FROM (SELECT id, ARRAY(SELECT DISTINCT lower(x) FROM unnest(contributors) x
                          WHERE x IS NOT NULL AND x <> '') arr

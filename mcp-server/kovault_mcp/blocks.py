@@ -13,10 +13,10 @@ may itself contain `---` lines; only the first two fences delimit the frontmatte
 """
 from __future__ import annotations
 
-_MARKERS = {"task", "decision", "source", "group", "header"}
+_MARKERS = {"task", "decision", "source", "group", "header", "edit"}
 
 TABLE = {"page": "pages", "task": "tasks", "decision": "decisions",
-         "source": "sources", "group": "groups", "header": "headers"}
+         "source": "sources", "group": "groups", "header": "headers", "edit": "edits"}
 
 # rendered frontmatter key -> DB column, per kind. Keys absent here are read-only on write
 # (created/updated/related/blockers/referenced by/contributors/members). id/type/trashed are
@@ -34,6 +34,7 @@ FIELD_MAP = {
                  "participants": "participants"},
     "header":   {"title": "title", "blurb": "blurb", "page_id": "page_id",
                  "index": "index", "level": "level"},
+    "edit":     {},   # audit-log row: no writable fields — write supports only delete (trashed:true)
 }
 # columns rendered as a ", "-joined list (render._list) -> split back to a list.
 _ARRAY_COLS = {"responsible", "participants", "contributors"}

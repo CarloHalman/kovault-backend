@@ -974,7 +974,12 @@ def write_sql(query: str) -> str:
     real tools and where a fallback was needed. Runs in a normal read-write transaction and COMMITS
     on success — it can modify data and schema, and it bypasses embedding / link / edit-log upkeep
     the fixed tools do, so reach for it only when they genuinely fall short. A statement with a
-    RETURNING clause echoes its rows (capped); otherwise the affected row count."""
+    RETURNING clause echoes its rows (capped); otherwise the affected row count.
+
+    AFTER a raw write that changed an embedded field (title/body/blurb/description/summary/status/
+    …), the row's embedding is now stale and its [[wikilinks]] unparsed: run `janitor -embed` to
+    re-embed stale rows (and `janitor -relink` to re-resolve links), OR redo the same change through
+    the `write` tool so that upkeep runs automatically. Prefer fixing it via `write` when you can."""
     q = (query or "").strip().rstrip(";")
     if not q:
         return "(empty query)"
@@ -1531,6 +1536,15 @@ def _dispatch_block(cur, p: dict, user: str, actor: str) -> str:
 
 def _dispatch_block_inner(cur, p: dict, user: str, actor: str) -> str:
     table, kind, rid, fields = p["table"], p["kind"], p["id"], p["fields"]
+    if kind == "edit":
+        # edits are the append-only audit log (no trashed_at) — write supports only hard delete,
+        # for pruning bad/noisy log rows. Delete-by-id, trashed:true required.
+        if not rid:
+            return "(skip: an edit block needs an id — deletion is by id)"
+        if not p["trashed"]:
+            return "(edits are audit-log rows — write supports only delete via trashed: true)"
+        cur.execute("DELETE FROM edits WHERE id=%s", (rid,))
+        return f"deleted edit {rid}" if cur.rowcount else f"(error: edit id {rid} not found)"
     if kind == "group":
         return _write_group(cur, rid, fields, p["trashed"])
     if p["trashed"]:
@@ -1572,7 +1586,9 @@ def write(blocks: list[str]) -> str:
     - `id:` present and live → UPDATE that row: only the fields you include change; an omitted field
       is left unchanged, an explicitly empty field is cleared. `id:` absent → INSERT. An `id:` that
       matches no live row is an ERROR (never a silent duplicate).
-    - Trash a row with `trashed: true` (or `freshness: trashed` on a page).
+    - Trash a row with `trashed: true` (or `freshness: trashed` on a page). A `type: edit` block
+      with an `id` and `trashed: true` HARD-deletes that audit-log row (edits have no trash state) —
+      for pruning noisy/bad log entries; get the id from read_sql or the export log.
     - Chunk ids come from `fetch(outline=true)` / `lookup(outline_page=…)` — a whole-page fetch
       does not show them. Links: `[text](kind:uuid)` / `[[wikilinks]]` in the body/description as
       before. Group membership and task blockers still use the `group` / `link` tools.
@@ -1838,8 +1854,8 @@ def _janitor_dedupe(cur, user: str) -> int:
 def _janitor_normalize_people(cur, user: str) -> int:
     """Case-fold (lowercase) + dedupe person values across contributors / responsible /
     participants (arrays) and decided_by (scalar). Matches the write-boundary lowercase norm, so
-    baked-in variants (Carlo/carlo, Quincy/quincy/QuincyK) collapse. Only changed rows are
-    rewritten + logged. This is also the one-off backfill for the append-only contributors mess."""
+    baked-in case/spelling variants of one person (e.g. Alice/alice, Bob/bob/BobK) collapse. Only
+    changed rows are rewritten + logged. Also the one-off backfill for the append-only contributors mess."""
     n = 0
     for table, col in (("pages", "contributors"), ("tasks", "responsible"),
                        ("groups", "participants")):

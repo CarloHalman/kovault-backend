@@ -137,6 +137,12 @@ class TestClassifyAndValues(unittest.TestCase):
         self.assertTrue(bl.parse_block(f"---\ntype: note\nid: {PID}\nfreshness: trashed\n---")["trashed"])
         self.assertFalse(bl.parse_block(f"---\ntype: task\nid: {TID}\nstatus: done\n---")["trashed"])
 
+    def test_edit_kind_delete(self):
+        p = bl.parse_block(f"---\ntype: edit\nid: {TID}\ntrashed: true\n---")
+        self.assertEqual((p["kind"], p["table"]), ("edit", "edits"))
+        self.assertTrue(p["trashed"])
+        self.assertEqual(p["warnings"], [])                 # id/type/trashed are all recognized
+
     def test_malformed_raises(self):
         with self.assertRaises(bl.BlockError):
             bl.parse_block("no fence here")
