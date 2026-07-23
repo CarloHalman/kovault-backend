@@ -507,6 +507,7 @@ def _precise_lookup(tables, filters, count, limit, offset) -> str:
 @mcp.tool
 def lookup(
     tables: list[str] | None = None,
+    query: str | None = None,
     include: list[str] | None = None,
     exclude: list[str] | None = None,
     groups_include: list[str] | None = None,
@@ -522,6 +523,8 @@ def lookup(
     searched) a PAGES index to fetch from.
 
     tables: searchable tables to hit — any of headers/tasks/decisions/sources (default headers).
+    query: a plain search string ("Search for: X, Exclude: Y") — parsed into include/exclude
+        terms (stopwords dropped), merged with any explicit include/exclude below.
     include/exclude: search TERMS (feed vector + BM25 + graph); exclude is BM25 must-not +
         graph negative anchor.
     groups_include/groups_exclude: membership filters over the `groups` table (names or ids),
@@ -539,8 +542,12 @@ def lookup(
     if filters is not None:
         return _precise_lookup((tables or ["tasks"]), filters, count, limit, offset)
     tables = [t for t in (tables or ["headers"]) if t in _SEARCH]
-    include = include or []
-    exclude = exclude or []
+    include = list(include or [])
+    exclude = list(exclude or [])
+    if query:
+        q_inc, q_exc = se.parse_search_input(query)   # plain "Search for: X, Exclude: Y" (F5)
+        include += [t for t in q_inc if t not in include]
+        exclude += [t for t in q_exc if t not in exclude]
 
     _maybe_auto_freshness()   # cooldowned upkeep; cheap, best-effort, never blocks the search
 
@@ -974,6 +981,27 @@ def _write_label(data: dict) -> str:
     return f'"{lbl}"' if lbl else "(untitled)"
 
 
+# same normalization as the tasks.title_norm generated column, so `%` hits the trigram index.
+_NORM_TITLE = "lower(f_unaccent(regexp_replace(coalesce(%s,''),'[-\\s]+','','g')))"
+
+
+def _similar_task_warn(cur, title: str | None) -> list[str]:
+    """Cheap near-duplicate check on task insert: trigram-match the new title against live tasks
+    (uses tasks_title_norm_trgm, no embedding/LLM call). Warns, never blocks."""
+    if not title or not title.strip():
+        return []
+    cur.execute(
+        f"SELECT id, title, round(similarity(title_norm, {_NORM_TITLE})::numeric, 2) AS sim "
+        f"FROM tasks WHERE trashed_at IS NULL AND title_norm %% {_NORM_TITLE} "
+        f"ORDER BY sim DESC LIMIT 3",
+        (title, title))
+    hits = cur.fetchall()
+    if not hits:
+        return []
+    joined = "; ".join(f'"{r["title"]}" ({r["id"]}, sim {r["sim"]})' for r in hits)
+    return [f"similar task(s) already exist — {joined}. Update one instead of duplicating?"]
+
+
 def _insert_one(cur, table: str, fields: dict, user: str, actor: str) -> tuple[str, list[str]]:
     """Insert one page/header/task/decision/source on an open cursor. Returns (id, warnings)."""
     warnings: list[str] = []
@@ -983,7 +1011,8 @@ def _insert_one(cur, table: str, fields: dict, user: str, actor: str) -> tuple[s
             "INSERT INTO pages (id, title, summary, type, freshness, contributors) "
             "VALUES (%s,%s,%s, coalesce(nullif(%s,''),%s), coalesce(%s,'hot')::page_freshness, %s)",
             (new_id, fields.get("title"), fields.get("summary"),
-             fields.get("type"), DEFAULT_PAGE_TYPE, fields.get("freshness"), [user]))
+             fields.get("type"), DEFAULT_PAGE_TYPE, fields.get("freshness"),
+             fields.get("contributors") or [user]))
     elif table == "headers":
         new_id = _insert_header(cur, fields)
         warnings += _sync_links(cur, "header", new_id, fields.get("body"), "headers", "body")
@@ -994,8 +1023,10 @@ def _insert_one(cur, table: str, fields: dict, user: str, actor: str) -> tuple[s
         _touch_contributors(cur, page_id=fields.get("page_id"), user=user)
     else:
         kind = SUBTYPE_KIND[table]
-        if table == "tasks" and not fields.get("responsible"):
-            fields["responsible"] = [user]        # default owner to the committing user (F4)
+        if table == "tasks":
+            warnings += _similar_task_warn(cur, fields.get("title"))   # dedupe hint (cheap, no LLM)
+            if not fields.get("responsible"):
+                fields["responsible"] = [user]    # default owner to the committing user (F4)
         new_id = _new_entity(cur, kind)
         _insert_subtype(cur, table, new_id, fields)
         text_field = "summary" if table == "sources" else "description"
@@ -1175,7 +1206,10 @@ def _update_one(cur, table: str, rid: str, set_fields: dict, user: str, actor: s
     # embedding deferred: updated_at bumps past embedded_at, so the worker re-embeds this row (F6).
     # (_embedded_field_changed / _embed_and_set stay for janitor -embed, the manual backstop.)
     if table == "pages":
-        _touch_contributors(cur, page_id=rid, user=user)
+        # an explicit contributors write REPLACES (honored above); skip the auto-append so a
+        # rewrite to a single canonical name isn't re-polluted by the connected username.
+        if "contributors" not in fieldset:
+            _touch_contributors(cur, page_id=rid, user=user)
     elif table == "headers":
         _touch_contributors(cur, page_id=str(row.get("page_id")), user=user)
     log_edit(cur, table_name=table, row_id=rid, operation="update", edited_by=user, actor=actor, changes=fieldset)
@@ -1330,8 +1364,10 @@ def group(
     """Prefer `write` (a `type: group` block) for group ROW create/update; this tool still handles
     membership (add/remove) and list. Flexible categories over entities (projects/topics/areas). action:
     create (name,type,description,participants) | update (id,set) | add (id,members) |
-    remove (id,members) | list ([type],[filter_name]). Membership is entity ids (pages/tasks/
-    decisions/sources). Groups are filterable in lookup and render via fetch/snippet."""
+    remove (id,members) | archive (id) | unarchive (id) | list ([type],[filter_name]). archive
+    sets archived_at and drops the group from default `list`s (also via write `trashed: true`);
+    unarchive reverses it. Membership is entity ids (pages/tasks/decisions/sources). Groups are
+    filterable in lookup and render via fetch/snippet."""
     with db().connection() as conn:
         with conn.cursor() as cur:
             if action == "create":
@@ -1351,6 +1387,13 @@ def group(
                             list(s.values()) + [id])
                 conn.commit()
                 return f"updated group {id}"
+            if action in ("archive", "unarchive"):
+                if not id:
+                    return "(archive needs a group id)"
+                cur.execute("UPDATE groups SET archived_at=%s WHERE id=%s",
+                            (None if action == "unarchive" else _now(), id))
+                conn.commit()
+                return f"(no such group {id})" if not cur.rowcount else f"{action}d group {id}"
             if action in ("add", "remove"):
                 for eid in members or []:
                     if action == "add":
@@ -1364,9 +1407,9 @@ def group(
                                     (id, eid))
                 conn.commit()
                 return f"{action} membership on group {id}: ok"
-    # list (read-only, no txn needed)
+    # list (read-only, no txn needed) — archived groups are hidden by default
     if action == "list":
-        clauses, params = [], []
+        clauses, params = ["archived_at IS NULL"], []
         if type:
             clauses.append("type=%s")
             params.append(type)
@@ -1424,7 +1467,10 @@ def _write_group(cur, rid: str | None, fields: dict, trashed: bool) -> str:
     """Group ROW create/update from a `type: group` block. Membership + listing stay on the
     `group` tool (a rendered member roster is labels, not a clean id set to reconcile from)."""
     if trashed:
-        return "(groups are not trashable via write — use the group tool)"
+        if not rid:
+            return "(skip: archiving a group needs an id)"
+        cur.execute("UPDATE groups SET archived_at=now() WHERE id=%s", (rid,))
+        return f"archived group {rid}" if cur.rowcount else f"(error: group id {rid} not found)"
     s = {k: v for k, v in fields.items() if k in {"name", "type", "description", "participants"}}
     _, err = _check_enums("groups", s)
     if err:
@@ -1450,6 +1496,10 @@ def _warns(ws: list[str]) -> str:
 
 
 def _dispatch_block(cur, p: dict, user: str, actor: str) -> str:
+    return _dispatch_block_inner(cur, p, user, actor) + _warns(p.get("warnings") or [])
+
+
+def _dispatch_block_inner(cur, p: dict, user: str, actor: str) -> str:
     table, kind, rid, fields = p["table"], p["kind"], p["id"], p["fields"]
     if kind == "group":
         return _write_group(cur, rid, fields, p["trashed"])
@@ -1526,8 +1576,9 @@ def janitor(flags: list[str] | None = None) -> str:
     (recompute hot/warm/cold by age; never touches static/archived/trashed), -dedupe (merge
     duplicate sources by sha256 and identical headers -> trash losers), -embed (re-embed rows
     with embedded_at < updated_at or null), -relink (re-resolve [[wikilinks]] over all live rows
-    so forward-references graph once their targets exist). There is no delete flag — trash is
-    terminal."""
+    so forward-references graph once their targets exist), -normalize-people (case-fold + dedupe
+    person values across contributors/responsible/participants/decided_by). There is no delete
+    flag — trash is terminal."""
     flags = [f.lstrip("-").lower() for f in (flags or [])]
     user = "janitor"
     counts: dict = {}
@@ -1554,6 +1605,9 @@ def janitor(flags: list[str] | None = None) -> str:
             if "dedupe" in flags:
                 counts["dedupe"] = _janitor_dedupe(cur, user)
                 report.append(f"Trashed {counts['dedupe']} duplicate row(s).")
+            if "normalize-people" in flags:
+                counts["normalize_people"] = _janitor_normalize_people(cur, user)
+                report.append(f"Normalized people on {counts['normalize_people']} row(s).")
             if "relink" in flags:
                 counts["relink"] = _janitor_relink(cur, user)
                 report.append(f"Resolved {counts['relink']} dangling wikilink edge(s).")
@@ -1751,6 +1805,33 @@ def _janitor_dedupe(cur, user: str) -> int:
     return trashed
 
 
+def _janitor_normalize_people(cur, user: str) -> int:
+    """Case-fold (lowercase) + dedupe person values across contributors / responsible /
+    participants (arrays) and decided_by (scalar). Matches the write-boundary lowercase norm, so
+    baked-in variants (Carlo/carlo, Quincy/quincy/QuincyK) collapse. Only changed rows are
+    rewritten + logged. This is also the one-off backfill for the append-only contributors mess."""
+    n = 0
+    for table, col in (("pages", "contributors"), ("tasks", "responsible"),
+                       ("groups", "participants")):
+        cur.execute(
+            f"UPDATE {table} t SET {col} = sub.arr "
+            f"FROM (SELECT id, ARRAY(SELECT DISTINCT lower(x) FROM unnest({col}) x "
+            f"                       WHERE x IS NOT NULL AND x <> '') arr "
+            f"      FROM {table} WHERE {col} IS NOT NULL) sub "
+            f"WHERE t.id = sub.id AND t.{col} IS DISTINCT FROM sub.arr RETURNING t.id")
+        for r in cur.fetchall():
+            log_edit(cur, table_name=table, row_id=str(r["id"]), operation="update",
+                     edited_by=user, actor="script", changes={col: "normalized"})
+            n += 1
+    cur.execute("UPDATE decisions SET decided_by = lower(decided_by) "
+                "WHERE decided_by IS DISTINCT FROM lower(decided_by) RETURNING id")
+    for r in cur.fetchall():
+        log_edit(cur, table_name="decisions", row_id=str(r["id"]), operation="update",
+                 edited_by=user, actor="script", changes={"decided_by": "normalized"})
+        n += 1
+    return n
+
+
 # =======================================================================================
 # export  (no-AI OKF bundle — manifest tool + streamed-zip download route)
 # =======================================================================================
@@ -1763,15 +1844,20 @@ def _export_scope(tables: list[str] | None, ids: list[str] | None) -> tuple[list
 
 @mcp.tool
 def export(tables: list[str] | None = None, ids: list[str] | None = None,
-           wikilinks: bool = False) -> str:
+           wikilinks: bool = False, group: str | None = None, linked_to: str | None = None) -> str:
     """Prepare a no-AI OKF markdown export (pages/tasks/decisions/sources/groups; default all).
     Returns only a MANIFEST — per-table row counts plus the download path — never the file
     contents, so exporting never bloats context. Download the zip out of band with the /export
-    command (it curls the path straight to a folder). tables: subset to export; ids: restrict to
-    specific row ids; wikilinks: rewrite [text](kind:uuid) links to [[Title]] wikilinks in the export."""
+    command (it curls the path straight to a folder). Scope, narrowest wins: ids (specific rows),
+    group (one group's members, exact name preferred), or linked_to (an id + its 1-hop graph
+    neighbours) — combine as needed; default is the whole table set. tables: subset to export;
+    wikilinks: rewrite [text](kind:uuid) links to [[Title]] wikilinks in the export."""
     sel, id_list = _export_scope(tables, ids)
     if not sel:
         return "(no valid tables; choose from pages,tasks,decisions,sources,groups)"
+    if group or linked_to:
+        scoped = export_mod.resolve_scope_ids(db(), group, linked_to)
+        id_list = list(dict.fromkeys((id_list or []) + (scoped or []))) or scoped
     c = export_mod.counts(db(), sel, id_list)
     qs = ("tables=" + ",".join(sel) + (("&ids=" + ",".join(id_list)) if id_list else "")
           + ("&wikilinks=1" if wikilinks else ""))
@@ -1791,9 +1877,14 @@ async def export_download(request: Request):
     tables = [t.strip() for t in (request.query_params.get("tables") or "").split(",") if t.strip()]
     ids = [i.strip() for i in (request.query_params.get("ids") or "").split(",") if i.strip()]
     wikilinks = (request.query_params.get("wikilinks") or "").lower() in ("1", "true", "yes")
+    group = request.query_params.get("group") or None
+    linked_to = request.query_params.get("linked_to") or None
     sel, id_list = _export_scope(tables, ids)
     if not sel:
         return JSONResponse({"error": "no valid tables"}, status_code=400)
+    if group or linked_to:
+        scoped = export_mod.resolve_scope_ids(db(), group, linked_to)
+        id_list = list(dict.fromkeys((id_list or []) + (scoped or []))) or scoped
     data = await run_in_threadpool(export_mod.bundle_zip, db(), sel, id_list, wikilinks)
     return Response(
         content=data, media_type="application/zip",

@@ -22,7 +22,8 @@ TABLE = {"page": "pages", "task": "tasks", "decision": "decisions",
 # (created/updated/related/blockers/referenced by/contributors/members). id/type/trashed are
 # handled separately; header `body` comes from the post-fence region, not a frontmatter key.
 FIELD_MAP = {
-    "page":     {"title": "title", "description": "summary", "freshness": "freshness", "type": "type"},
+    "page":     {"title": "title", "description": "summary", "freshness": "freshness", "type": "type",
+                 "contributors": "contributors"},
     "task":     {"title": "title", "description": "description", "status": "status",
                  "priority": "priority", "scope": "scope", "deadline": "deadline",
                  "responsible": "responsible"},
@@ -35,7 +36,40 @@ FIELD_MAP = {
                  "index": "index", "level": "level"},
 }
 # columns rendered as a ", "-joined list (render._list) -> split back to a list.
-_ARRAY_COLS = {"responsible", "participants"}
+_ARRAY_COLS = {"responsible", "participants", "contributors"}
+
+# --- anomaly detection (F: no silent failures) -----------------------------------------
+# Keys `fetch` echoes that are read-only metadata or derived from other data — silently
+# ignored on write (a full round-trip includes them; warning on each would be noise).
+_META_KEYS = {"id", "type", "trashed", "created", "updated", "completed", "related",
+              "referenced by"}
+# Keys that carry REAL data but are written through a different tool, not `write`. A non-empty
+# value here is dropped, so it must be reported (e.g. a task's `blockers:` was silently eaten).
+_OTHER_TOOL = {"blockers": "the link tool (task_dependencies)",
+               "members": "the group tool (add/remove)"}
+# DB column name a user might type instead of the template key (old insert/update API shape).
+# Auto-derived: any FIELD_MAP entry whose column differs from its template key.
+_RENAME_HINTS = {kind: {col: key for key, col in m.items() if col != key}
+                 for kind, m in FIELD_MAP.items()}
+
+
+def _detect_anomalies(kind: str, raw: dict) -> list[str]:
+    """Report frontmatter keys that `write` would silently drop: unknown keys (typos / old
+    column names) and other-tool keys carrying a value. Recognized writable + metadata keys
+    stay quiet so a clean round-trip reports nothing."""
+    recognized = set(FIELD_MAP[kind]) | _META_KEYS
+    hints = _RENAME_HINTS.get(kind, {})
+    warns: list[str] = []
+    for key, val in raw.items():
+        if key in recognized:
+            continue
+        if key in _OTHER_TOOL:
+            if (val or "").strip():
+                warns.append(f"'{key}' is set via {_OTHER_TOOL[key]}, not write — value dropped")
+            continue
+        hint = f" — did you mean '{hints[key]}'?" if key in hints else ""
+        warns.append(f"unknown key '{key}' for {kind}{hint} — value dropped")
+    return warns
 
 
 class BlockError(ValueError):
@@ -107,4 +141,4 @@ def parse_block(text: str) -> dict:
     trashed = (raw.get("trashed", "").strip().lower() in ("true", "yes", "1")
                or (kind == "page" and raw.get("freshness") == "trashed"))
     return {"kind": kind, "table": TABLE[kind], "id": raw.get("id") or None,
-            "fields": fields, "trashed": trashed, "warnings": []}
+            "fields": fields, "trashed": trashed, "warnings": _detect_anomalies(kind, raw)}

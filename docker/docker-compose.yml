@@ -9,6 +9,7 @@ name: kovault
 
 services:
   kovault-db:
+    container_name: kovault-database   # stable name; the service key stays kovault-db (network alias)
     restart: unless-stopped         # returns after a host reboot
     build:
       context: .
@@ -31,6 +32,7 @@ services:
       retries: 20
 
   kovault-mcp:
+    container_name: kovault-mcp
     restart: unless-stopped
     build:
       context: ../mcp-server

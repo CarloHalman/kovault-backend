@@ -66,7 +66,31 @@ class TestRoundTrip(unittest.TestCase):
         self.assertEqual(p["fields"]["type"], "note")       # page type preserved
         self.assertEqual(p["fields"]["summary"], "hub")     # description -> summary
         self.assertEqual(p["fields"]["freshness"], "hot")
-        self.assertNotIn("contributors", p["fields"])       # read-only
+        self.assertEqual(p["fields"]["contributors"], ["alice"])  # now rewritable (A2)
+        self.assertEqual(p["warnings"], [])                  # clean round-trip => no anomalies
+
+
+class TestAnomalies(unittest.TestCase):
+    """No silent failures (A1): write reports keys it would otherwise drop."""
+
+    def test_bogus_key_warns(self):
+        p = bl.parse_block(f"---\ntype: task\nid: {TID}\ntitle: X\nbogus: 1\n---")
+        self.assertTrue(any("bogus" in w for w in p["warnings"]))
+
+    def test_page_summary_alias_hint(self):
+        # old insert/update used the `summary` column; the write template key is `description`
+        p = bl.parse_block(f"---\ntype: note\nid: {PID}\nsummary: hub\n---")
+        self.assertTrue(any("summary" in w and "description" in w for w in p["warnings"]))
+        self.assertNotIn("summary", p["fields"])             # dropped, but now reported
+
+    def test_task_blockers_other_tool_warns(self):
+        p = bl.parse_block(f"---\ntype: task\nid: {TID}\ntitle: X\nblockers: some task\n---")
+        self.assertTrue(any("blockers" in w and "link tool" in w for w in p["warnings"]))
+
+    def test_empty_other_tool_key_is_quiet(self):
+        # a clean round-trip echoes `blockers:` empty — that must NOT warn
+        p = bl.parse_block(f"---\ntype: task\nid: {TID}\ntitle: X\nblockers: \n---")
+        self.assertEqual(p["warnings"], [])
 
 
 class TestHeaderBlock(unittest.TestCase):

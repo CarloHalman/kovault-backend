@@ -5,6 +5,34 @@ from datetime import datetime
 from kovault_mcp import export as ex
 
 
+class TestTaskTree(unittest.TestCase):
+    """Native task-tree mode (folds scripts/task_page.py): blocker nesting, open-only default."""
+    TASKS = {
+        "Ship":   {"status": "todo", "description": "", "created": "2026-01-03", "blockers": ["Build, test"]},
+        "Build, test": {"status": "todo", "description": "core", "created": "2026-01-02", "blockers": ["Design"]},
+        "Design": {"status": "done", "description": "", "created": "2026-01-01", "blockers": []},
+    }
+
+    def test_open_only_nesting(self):
+        children, roots = ex._build_tree(self.TASKS, include_done=False)
+        self.assertEqual(roots, ["Ship"])                  # Ship blocked only by open tasks -> root
+        self.assertEqual(children["Ship"], ["Build, test"])  # comma-in-title blocker kept intact
+        self.assertNotIn("Design", children["Build, test"])  # done blocker dropped when open-only
+
+    def test_render_checkbox_and_count(self):
+        children, roots = ex._build_tree(self.TASKS, include_done=False)
+        live = {t: v for t, v in self.TASKS.items() if v["status"] != "done"}
+        md = ex._render_tree(live, children, roots, "Demo tasks")
+        self.assertIn("- [ ] Ship", md)
+        self.assertIn("  - [ ] Build, test", md)           # nested one level under Ship
+        self.assertIn("2 tasks, 0 done, 2 open.", md)
+
+    def test_include_done_shows_all(self):
+        children, roots = ex._build_tree(self.TASKS, include_done=True)
+        self.assertEqual(roots, ["Ship"])
+        self.assertEqual(children["Build, test"], ["Design"])
+
+
 class TestPathHelpers(unittest.TestCase):
     def test_seg_fallback_and_slug(self):
         self.assertEqual(ex._seg(None), "unknown")

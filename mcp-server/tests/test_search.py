@@ -5,6 +5,26 @@ import unittest
 from kovault_mcp import search as se
 
 
+class TestParseSearchInput(unittest.TestCase):
+    def test_both_clauses(self):
+        inc, exc = se.parse_search_input("Search for: docker deploy, Exclude: windows legacy")
+        self.assertEqual(inc, ["docker", "deploy"])
+        self.assertEqual(exc, ["windows", "legacy"])
+
+    def test_leadin_and_stopwords_dropped(self):
+        inc, exc = se.parse_search_input("find the notes about the embedding model")
+        self.assertEqual(inc, ["notes", "embedding", "model"])   # the/about/for dropped
+        self.assertEqual(exc, [])
+
+    def test_without_synonym(self):
+        inc, exc = se.parse_search_input("kovault backend without ollama")
+        self.assertEqual(inc, ["kovault", "backend"])
+        self.assertEqual(exc, ["ollama"])
+
+    def test_empty(self):
+        self.assertEqual(se.parse_search_input(""), ([], []))
+
+
 class TestRRF(unittest.TestCase):
     def test_fuse_sums_reciprocal_ranks(self):
         k = 60

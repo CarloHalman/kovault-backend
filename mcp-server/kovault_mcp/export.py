@@ -265,17 +265,151 @@ def _write(folder: Path, slug: str, body: str, written: list[str]) -> str:
     return f"{folder.name}/{slug}.md"
 
 
+# ---- scope resolution (export --group / --linked-to) --------------------------------------
+
+def resolve_scope_ids(dbx: Database, group: str | None = None,
+                      linked_to: str | None = None) -> list[str] | None:
+    """Turn a `group` name (exact match preferred, else substring) or a `linked_to` entity id
+    (that id + its 1-hop graph neighbours) into a concrete id list the existing `ids` filter
+    consumes. Returns None when nothing resolves (caller keeps its explicit ids / full scope)."""
+    ids: list[str] = []
+    if group:
+        row = (dbx.query_one("SELECT id FROM groups WHERE lower(name)=lower(%s) AND archived_at IS NULL "
+                             "ORDER BY created_at LIMIT 1", (group,))
+               or dbx.query_one("SELECT id FROM groups WHERE name ILIKE %s AND archived_at IS NULL "
+                                "ORDER BY created_at LIMIT 1", (f"%{group}%",)))
+        if row:
+            ids += [str(r["entity_id"]) for r in dbx.query(
+                "SELECT entity_id FROM group_links WHERE group_id=%s", (row["id"],))]
+    if linked_to:
+        ids.append(linked_to)
+        ids += [str(r["id"]) for r in dbx.query(
+            "SELECT to_id AS id FROM links WHERE from_id=%s "
+            "UNION SELECT from_id AS id FROM links WHERE to_id=%s", (linked_to, linked_to))]
+    return list(dict.fromkeys(ids)) or None
+
+
+# ---- task-tree native export mode (folds scripts/task_page.py) -----------------------------
+
+def _task_rows(dbx: Database, group: str | None, terms: list[str] | None) -> dict[str, dict]:
+    """Return {title: {status, created, description, blockers:[title,...]}} for a group's tasks
+    (exact-name match preferred) or a keyword search. Blockers come straight from
+    task_dependencies joined on id, so a title containing commas never mis-splits."""
+    if group:
+        grow = (dbx.query_one("SELECT id FROM groups WHERE lower(name)=lower(%s) ORDER BY created_at LIMIT 1", (group,))
+                or dbx.query_one("SELECT id FROM groups WHERE name ILIKE %s ORDER BY created_at LIMIT 1", (f"%{group}%",)))
+        if not grow:
+            return {}
+        rows = dbx.query(
+            "SELECT t.* FROM tasks t JOIN group_links gl ON gl.entity_id=t.id "
+            "WHERE gl.group_id=%s AND t.trashed_at IS NULL ORDER BY t.created_at", (grow["id"],))
+    else:
+        like = "%" + "%".join(terms or []) + "%"
+        rows = dbx.query("SELECT * FROM tasks WHERE trashed_at IS NULL AND title ILIKE %s "
+                         "ORDER BY created_at", (like,))
+    out: dict[str, dict] = {}
+    for r in rows:
+        blockers = [b["title"] for b in dbx.query(
+            "SELECT t.title FROM task_dependencies d JOIN tasks t ON t.id=d.blocker "
+            "WHERE d.dependent=%s ORDER BY t.created_at", (r["id"],))]
+        out[r["title"]] = {"status": r.get("status") or "todo", "description": r.get("description") or "",
+                           "created": (r["created_at"].isoformat() if r.get("created_at") else "1970-01-01T00:00:00"),
+                           "blockers": blockers}
+    return out
+
+
+def _build_tree(tasks: dict[str, dict], include_done: bool) -> tuple[dict[str, list[str]], list[str]]:
+    live = tasks if include_done else {t: v for t, v in tasks.items() if v["status"] != "done"}
+    children: dict[str, list[str]] = {}
+    for title, t in live.items():
+        blk = [b for b in t["blockers"] if b in live and (include_done or tasks.get(b, {}).get("status") != "done")]
+        children[title] = sorted(blk, key=lambda b: live[b]["created"])
+    all_kids = {c for kids in children.values() for c in kids}
+    roots = sorted([t for t in live if t not in all_kids], key=lambda t: live[t]["created"])
+    return children, roots
+
+
+def _fmt_date(iso: str) -> str:
+    try:
+        return datetime.fromisoformat(iso).strftime("%-d %b %Y")
+    except ValueError:
+        return iso
+
+
+def _render_tree(tasks: dict[str, dict], children: dict[str, list[str]], roots: list[str], heading: str) -> str:
+    total = len(tasks)
+    done = sum(1 for t in tasks.values() if t["status"] == "done")
+    lines = [f"# {heading}", "", f"{total} tasks, {done} done, {total - done} open.", ""]
+
+    def render(title: str, depth: int) -> None:
+        t = tasks[title]
+        indent = "  " * depth
+        mark = "x" if t["status"] == "done" else " "
+        lines.append(f"{indent}- [{mark}] {title} — {_fmt_date(t['created'])}")
+        if t["description"]:
+            lines.append(f"{indent}  - *{t['description']}*")
+        for child in children.get(title, []):
+            render(child, depth + 1)
+
+    for r in roots:
+        render(r, 0)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def task_tree(dbx: Database, group: str | None = None, terms: list[str] | None = None,
+              include_done: bool = False) -> str:
+    """Checkable, collapsible markdown task tree (each task nested under whichever task blocks it,
+    oldest-first). Native replacement for scripts/task_page.py — reads the DB directly."""
+    tasks = _task_rows(dbx, group, terms)
+    children, roots = _build_tree(tasks, include_done)
+    live = tasks if include_done else {t: v for t, v in tasks.items() if v["status"] != "done"}
+    heading = f"{group} tasks" if group else f"Tasks matching: {' '.join(terms or [])}"
+    return _render_tree(live, children, roots, heading)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Export the Kovault DB as a Google OKF markdown bundle.")
-    ap.add_argument("--out", default="export/out", help="output directory")
+    ap.add_argument("--out", default="kovault-export/out", help="output directory (or file for --task-tree)")
     ap.add_argument("--tables", default=",".join(TABLES), help="comma list: pages,tasks,decisions,sources,groups")
     ap.add_argument("--ids", default="", help="optional comma list of row ids to restrict to")
+    ap.add_argument("--group", default="", help="restrict scope to one group's members (or the --task-tree group)")
+    ap.add_argument("--linked-to", default="", help="restrict scope to an id and its 1-hop graph neighbours")
+    ap.add_argument("--task-tree", action="store_true", help="emit a single blocker-nested task-tree .md instead of a bundle")
+    ap.add_argument("--filter", nargs="+", help="task-tree: search terms instead of a group")
+    ap.add_argument("--include-done", action="store_true", help="task-tree: keep done tasks (default open only)")
     ap.add_argument("--wikilinks", action="store_true",
                     help="convert [text](kind:uuid) markdown links to [[Title]] wikilinks")
     args = ap.parse_args()
+
+    if args.task_tree:
+        from .db import Database
+        dbx = Database(Config())
+        dbx.open()
+        try:
+            md = task_tree(dbx, args.group or None, args.filter, args.include_done)
+        finally:
+            dbx.close()
+        out = Path(args.out)
+        if out.suffix != ".md":
+            out = out / ((_slug(args.group or " ".join(args.filter or []), "tasks")) + "-tasks.md")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(md, encoding="utf-8")
+        print(f"wrote task tree to {out}")
+        return
+
     tables = [t.strip() for t in args.tables.split(",") if t.strip() in TABLES]
-    ids = [i.strip() for i in args.ids.split(",") if i.strip()] or None
-    written = export(args.out, tables, ids, args.wikilinks)
+    ids = [i.strip() for i in args.ids.split(",") if i.strip()]
+    if args.group or args.linked_to:
+        from .db import Database
+        dbx = Database(Config())
+        dbx.open()
+        try:
+            scoped = resolve_scope_ids(dbx, args.group or None, args.linked_to or None)
+        finally:
+            dbx.close()
+        ids = (ids + (scoped or [])) or ids
+    written = export(args.out, tables, ids or None, args.wikilinks)
     print(f"exported {len(written)} file(s) to {args.out}")
 
 

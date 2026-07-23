@@ -25,6 +25,41 @@ def normalize_term(s: str | None) -> str:
     return re.sub(r"[-\s]+", "", s).lower()
 
 # ---------------------------------------------------------------------------------------
+# Plain-string query parsing (F5): "Search for: X, Exclude: Y" -> (include, exclude) terms.
+# ---------------------------------------------------------------------------------------
+
+# tiny stopword set — common function words that add noise, not signal, to keyword/vector arms.
+_STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "of", "to", "in", "on", "for", "with", "at", "by",
+    "from", "about", "as", "is", "are", "was", "were", "be", "been", "it", "this", "that",
+    "these", "those", "i", "me", "my", "we", "our", "you", "your", "all", "any", "search",
+}
+_EXCLUDE_RE = re.compile(r"\b(?:exclude|excluding|without|not|-but not)\b\s*:?", re.IGNORECASE)
+_LEADIN_RE = re.compile(r"^\s*(?:search\s+for|find|lookup|look\s+for)\s*:?\s*", re.IGNORECASE)
+
+
+def _terms(clause: str) -> list[str]:
+    """Lowercase word-tokens of a clause, stopwords dropped, order preserved, deduped."""
+    seen: dict[str, None] = {}
+    for w in re.findall(r"[\w']+", clause.lower()):
+        if w and w not in _STOPWORDS:
+            seen.setdefault(w, None)
+    return list(seen)
+
+
+def parse_search_input(text: str) -> tuple[list[str], list[str]]:
+    """Split a plain search string into (include, exclude) term lists. Understands an optional
+    'Search for:' lead-in and an 'Exclude:'/'without'/'not' clause; everything before the first
+    exclude marker is include, everything after is exclude. Stopwords are dropped from both."""
+    if not text or not text.strip():
+        return [], []
+    body = _LEADIN_RE.sub("", text.strip())
+    m = _EXCLUDE_RE.search(body)
+    inc_part, exc_part = (body[: m.start()], body[m.end():]) if m else (body, "")
+    return _terms(inc_part), _terms(exc_part)
+
+
+# ---------------------------------------------------------------------------------------
 # RRF fusion
 # ---------------------------------------------------------------------------------------
 

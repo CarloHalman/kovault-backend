@@ -48,7 +48,8 @@ CREATE TABLE groups (
   name         varchar(64)   NOT NULL,
   type         group_types   NOT NULL,                  -- loose, flexible categories
   description  varchar(512),
-  participants varchar(64)[]
+  participants varchar(64)[],
+  archived_at  timestamptz                              -- null = live; set by group archive (drops from default lists)
 );
 
 CREATE TABLE group_links (

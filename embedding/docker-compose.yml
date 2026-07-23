@@ -9,6 +9,7 @@ name: embedding
 
 services:
   embedding:
+    container_name: kovault-embedding
     image: ollama/ollama:latest
     restart: unless-stopped
     environment:
