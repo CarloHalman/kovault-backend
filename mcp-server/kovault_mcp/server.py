@@ -1827,7 +1827,7 @@ def _janitor_normalize_people(cur, user: str) -> int:
         cur.execute(
             f"UPDATE {table} t SET {col} = sub.arr "
             f"FROM (SELECT id, ARRAY(SELECT DISTINCT lower(x) FROM unnest({col}) x "
-            f"                       WHERE x IS NOT NULL AND x <> '') arr "
+            f"                       WHERE x IS NOT NULL AND x <> '')::varchar(64)[] arr "
             f"      FROM {table} WHERE {col} IS NOT NULL) sub "
             f"WHERE t.id = sub.id AND t.{col} IS DISTINCT FROM sub.arr RETURNING t.id")
         for r in cur.fetchall():

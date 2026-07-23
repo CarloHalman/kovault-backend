@@ -19,19 +19,19 @@ ALTER TABLE groups ADD COLUMN IF NOT EXISTS archived_at timestamptz;
 -- deploy lands clean. Only rewrites rows that actually change.
 UPDATE pages t SET contributors = sub.arr
   FROM (SELECT id, ARRAY(SELECT DISTINCT lower(x) FROM unnest(contributors) x
-                         WHERE x IS NOT NULL AND x <> '') arr
+                         WHERE x IS NOT NULL AND x <> '')::varchar(64)[] arr
         FROM pages WHERE contributors IS NOT NULL) sub
   WHERE t.id = sub.id AND t.contributors IS DISTINCT FROM sub.arr;
 
 UPDATE tasks t SET responsible = sub.arr
   FROM (SELECT id, ARRAY(SELECT DISTINCT lower(x) FROM unnest(responsible) x
-                         WHERE x IS NOT NULL AND x <> '') arr
+                         WHERE x IS NOT NULL AND x <> '')::varchar(64)[] arr
         FROM tasks WHERE responsible IS NOT NULL) sub
   WHERE t.id = sub.id AND t.responsible IS DISTINCT FROM sub.arr;
 
 UPDATE groups t SET participants = sub.arr
   FROM (SELECT id, ARRAY(SELECT DISTINCT lower(x) FROM unnest(participants) x
-                         WHERE x IS NOT NULL AND x <> '') arr
+                         WHERE x IS NOT NULL AND x <> '')::varchar(64)[] arr
         FROM groups WHERE participants IS NOT NULL) sub
   WHERE t.id = sub.id AND t.participants IS DISTINCT FROM sub.arr;
 
