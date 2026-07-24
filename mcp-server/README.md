@@ -14,10 +14,10 @@ and edit logging.
 | `snippet` | read | id/title/summary/freshness for expanding links. |
 | `rows` | read | Backup raw read of any table (op whitelist, hard limit, every call logged). |
 | `sql` | read | Debug-only raw read-only SQL (gated on debug mode, every call logged). |
-| `write` | write | Unified create / update / trash for every entity via `---`-fenced blocks; embeds, parses links, page-rename cascade, appends contributors, logs edits. |
-| `insert` / `update` / `delete` | write | Legacy single-entity create / edit / trash. Still work but **deprecated** in favor of `write`. |
-| `link` | write | Manual fix for auto-linking (links / header_sources / task_dependencies / group_links). |
-| `group` | write | Create/manage flexible categories + membership. |
+| `write` | write | Unified create / update / trash for every entity via `---`-fenced blocks; embeds, parses links, page-rename cascade, appends contributors, logs edits. Also reconciles group members, task blockers, header sources and group archive from the block. |
+| `insert` / `update` / `delete` | write | Legacy single-entity create / edit / trash. **Deprecated, marked for removal** — use `write`. |
+| `link` | write | Manual junction repair (links / header_sources / task_dependencies / group_links). **Deprecated, marked for removal** — `write` reconciles all four from the block. |
+| `group` | write | Create/manage flexible categories + membership. **Deprecated, marked for removal** — `write` covers row/members/archive; only `group list` (a read) has no `write` equivalent. |
 | `janitor` | write | Maintenance: diagnose (bare) + `-lint` / `-freshness` / `-dedupe` / `-embed`. |
 | `export` | read | Manifest (per-table counts + download path) for a no-AI OKF bundle. The bundle itself streams as a zip from the `GET /export` route, so its contents never enter context. |
 

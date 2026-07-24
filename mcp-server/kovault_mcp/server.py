@@ -1066,7 +1066,7 @@ def _insert_one(cur, table: str, fields: dict, user: str, actor: str) -> tuple[s
 
 @mcp.tool
 def insert(table: str, fields: dict | None = None, rows: list[dict] | None = None) -> str:
-    """Deprecated — prefer the unified `write` tool (kept this release for compatibility).
+    """Deprecated, marked for removal — prefer the unified `write` tool (kept this release).
     Create a page / header / task / decision / source. The server creates the entity row,
     embeds from the row's fields, parses markdown links into the graph, and logs an edit.
     edited_by/actor are stamped from the session — do not set them. For groups use `group`; for
@@ -1246,7 +1246,7 @@ def _update_one(cur, table: str, rid: str, set_fields: dict, user: str, actor: s
 @mcp.tool
 def update(table: str, id: str | None = None, set: dict | None = None,
            updates: list[dict] | None = None) -> str:
-    """Deprecated — prefer the unified `write` tool (kept this release for compatibility).
+    """Deprecated, marked for removal — prefer the unified `write` tool (kept this release).
     Edit fields on an existing row. Re-embeds if an embedded field changed; re-parses links if a
     text field changed; appends you to the page's contributors; logs an edit. Page-title rename
     rebuilds header paths and marks that page's chunks stale for /janitor -embed. Set
@@ -1303,7 +1303,7 @@ def _rename_cascade(cur, page_id: str, new_title: str) -> None:
 
 @mcp.tool
 def delete(table: str, ids: list[str]) -> str:
-    """Deprecated — prefer the unified `write` tool with `trashed: true` (kept this release).
+    """Deprecated, marked for removal — prefer `write` with `trashed: true` (kept this release).
     Trash rows (nothing is ever hard-deleted). Pages -> freshness='trashed';
     headers/tasks/decisions/sources -> trashed_at=now(). Logs an edit (operation='trash').
     Trashed rows drop out of lookup/snippet but stay fetchable by id. Recover with update."""
@@ -1336,9 +1336,9 @@ def delete(table: str, ids: list[str]) -> str:
 
 @mcp.tool
 def link(action: str, table: str, fields: dict | list[dict]) -> str:
-    """Prefer `write` for entity links (markdown/[[wikilinks]] in a body). Still the path for
-    junction rows write does not cover: task_dependencies, header_sources, group_links.
-    Manual repair for auto-linking. action: add|remove. table: links | header_sources |
+    """DEPRECATED, marked for removal — `write` now reconciles every junction from the block
+    (a task's `blockers:`, a group's `members:`, a header's `sources:`, plus body links). Kept this
+    release as the manual repair path for auto-linking. action: add|remove. table: links | header_sources |
     task_dependencies | group_links. fields carries that table's columns (e.g. task_dependencies:
     blocker, dependent; links: from_kind, from_id, to_kind, to_id). Pass a LIST of field dicts to
     add/remove many junction rows in one transaction (the relinker path)."""
@@ -1388,8 +1388,10 @@ def group(
     set: dict | None = None,
     filter_name: str | None = None,
 ) -> str:
-    """Prefer `write` (a `type: group` block) for group ROW create/update; this tool still handles
-    membership (add/remove) and list. Flexible categories over entities (projects/topics/areas). action:
+    """DEPRECATED, marked for removal — `write` (a `type: group` block) now covers group row,
+    `members:` (membership) and `archived:` (archive/unarchive); only `list` here (a read) has no
+    `write` equivalent yet — use `lookup` over the groups table. Flexible categories over entities
+    (projects/topics/areas). action:
     create (name,type,description,participants) | update (id,set) | add (id,members) |
     remove (id,members) | archive (id) | unarchive (id) | list ([type],[filter_name]). archive
     sets archived_at and drops the group from default `list`s (also via write `trashed: true`);
