@@ -134,6 +134,26 @@ def _split(text: str) -> tuple[list[str], str]:
     return lines[1:close], "\n".join(lines[close + 1:]).strip("\n")
 
 
+def _count_extra_templates(body: str) -> int:
+    """Concatenated-template guard (bug #1). Every rendered template leads its frontmatter with a
+    `type:` line, so a `---` fence inside `body` whose next non-blank line is a `type:` key marks
+    another `---`-fenced template joined into this one array element — `_split` only parses the
+    first, and the rest would be silently swallowed into this body and lost. Counts those; a plain
+    `---` body rule (next non-blank line is prose) is not one.
+    ponytail: `type:`-after-fence heuristic, not full fence-pair validation — a header body that
+    literally documents `---`/`type:` lines would false-positive; upgrade to a real fence-pair scan
+    if that ever bites."""
+    lines = body.splitlines()
+    extra = 0
+    for i, ln in enumerate(lines):
+        if ln.strip() != "---":
+            continue
+        nxt = next((l for l in lines[i + 1:] if l.strip()), "")   # first non-blank after the fence
+        if nxt.split(":", 1)[0].strip() == "type":
+            extra += 1
+    return extra
+
+
 def _frontmatter(fm_lines: list[str]) -> dict:
     """Parse `key: value` lines. Keys never contain ':' (render owns them), so partition on the
     FIRST ':' is exact even when the (quoted) value contains one. A duplicate key is rejected, not
@@ -161,6 +181,11 @@ def parse_block(text: str) -> dict:
     """One template block -> {kind, table, id, fields, trashed, warnings}. `fields` are DB columns
     (empty value -> None; ", "-list -> list). Raises BlockError on a malformed block."""
     fm_lines, body = _split(text)
+    extra = _count_extra_templates(body)
+    if extra:
+        raise BlockError(
+            f"this block concatenates {extra + 1} templates — pass one '---'-fenced template per "
+            "blocks[] element, not several joined in one string (only the first would be written)")
     raw = _frontmatter(fm_lines)
     kind = classify(raw)
     fields: dict = {}

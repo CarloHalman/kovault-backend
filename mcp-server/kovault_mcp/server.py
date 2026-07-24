@@ -1618,20 +1618,33 @@ def write(blocks: list[str]) -> str:
     - Junction rosters reconcile from the block (present = set to that list, empty = clear all,
       absent = leave): a task's `blockers:` (dependencies), a group's `members:` (entity ids), a
       header's `sources:` (source ids). A group's `archived:` sets/clears its archived state.
+    - Write is fire-and-forget: ~5s delay before a new/updated row is searchable via `lookup`.
+      `fetch` by id is instant. To confirm a write immediately, `fetch` the id — do not `lookup`.
+    - All-or-nothing: if ANY block is invalid the whole batch is rejected and nothing is written.
     """
     user, actor = _identity()
-    parsed, lines = [], []
+    # Phase 1: parse/validate EVERY block first — no DB touched. Any BlockError aborts the whole
+    # batch (all-or-nothing), so one bad block never half-writes its valid siblings.
+    parsed, errs = [], []
     for i, b in enumerate(blocks or []):
         try:
             parsed.append(bl.parse_block(b))
         except bl.BlockError as e:
-            lines.append(f"(error: block {i}: {e})")
+            errs.append(f"(error: block {i}: {e})")
+    if errs:
+        return "\n".join(errs) + "\n(no rows written — fix the error(s) and resend the batch)"
     if not parsed:
-        return "\n".join(lines) or "(nothing to write)"
+        return "(nothing to write)"
+    # Phase 2: all blocks parsed — dispatch in one transaction. A dispatch-time error (bad enum,
+    # dead id, missing page_id) rolls the WHOLE batch back rather than committing the good rows.
+    lines = []
     with db().connection() as conn:
         with conn.cursor() as cur:
             for p in parsed:
                 lines.append(_dispatch_block(cur, p, user, actor))
+        if any(ln.lstrip().startswith("(error:") for ln in lines):
+            conn.rollback()
+            return "\n".join(lines) + "\n(rolled back — no rows written; fix the error(s) and resend)"
         conn.commit()
     return "\n".join(lines)
 
@@ -2043,6 +2056,8 @@ async def debug_log_ingest(request: Request):
     def _do() -> str:
         with db().connection() as conn:
             with conn.cursor() as cur:
+                # duration_ms is client-measured tool-call round-trip latency (plugin PostToolUse
+                # hook), NOT server compute time — do not read it as server write time.
                 cur.execute(
                     "INSERT INTO debug_log (session_id, edited_by, tool, tool_input, "
                     "result_summary, result, result_tokens, duration_ms, last_user_msg, assistant_text) "

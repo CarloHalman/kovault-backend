@@ -208,7 +208,8 @@ CREATE TABLE debug_log (
   result         text,                          -- raw tool result (server return), capped; token
                                                 --   cost is recomputable from this + the raw fields
   result_tokens  integer,                      -- convenience estimate of result token cost (chars/4)
-  duration_ms    integer,                      -- end-to-end tool latency measured client-side
+  duration_ms    integer,                      -- client-measured tool-call round-trip latency
+                                                --   (plugin hook), NOT server compute time
   last_user_msg  text,                         -- the user message that led here
   assistant_text text                          -- Claude's text this turn up to the tool call
 );

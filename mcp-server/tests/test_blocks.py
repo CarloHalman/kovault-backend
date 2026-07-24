@@ -195,5 +195,31 @@ class TestClassifyAndValues(unittest.TestCase):
             bl.parse_block("---\ntype: group\nname: x\ntype: topic\n---")
 
 
+class TestConcatenatedTemplates(unittest.TestCase):
+    """bug #1: several `---`-fenced templates joined into one blocks[] element must fail loud,
+    not silently keep only the first (the rest vanish into the body)."""
+
+    def test_page_plus_headers_concatenated_raises(self):
+        # one element = a page template + two header templates -> BlockError, writes nothing
+        text = (f"---\ntype: note\ntitle: Home\n---\nsummary body\n"
+                f"---\ntype: header\npage_id: {PID}\nindex: 0\ntitle: A\n---\nbody A\n"
+                f"---\ntype: header\npage_id: {PID}\nindex: 1\ntitle: B\n---\nbody B")
+        with self.assertRaises(bl.BlockError):
+            bl.parse_block(text)
+
+    def test_full_page_render_still_parses(self):
+        # a fetched full page renders its chunks WITHOUT fences -> not a concatenation, must parse
+        page = {"type": "note", "title": "Home", "id": PID, "summary": "hub",
+                "created_at": None, "updated_at": None, "freshness": "hot", "contributors": []}
+        headers = [{"title": "Intro", "body": "hello", "page_id": PID, "index": 0}]
+        self.assertEqual(bl.parse_block(rnd.render_page(page, headers))["kind"], "page")
+
+    def test_header_body_with_plain_rule_still_ok(self):
+        # a genuine `---` rule in a header body (next line is prose) is NOT a concatenated template
+        text = (f"---\ntype: header\npage_id: {PID}\nindex: 0\ntitle: T\n---\n"
+                "before\n---\nafter")
+        self.assertIn("after", bl.parse_block(text)["fields"]["body"])
+
+
 if __name__ == "__main__":
     unittest.main()
