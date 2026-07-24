@@ -144,6 +144,7 @@ def render_group(g: dict, members: list[tuple[str, str, str]] | None = None,
         f"id: {g.get('id')}",
         f"description: {_q(g.get('description') or '')}",
         f"participants: {_q(_list(g.get('participants')))}",
+        f"archived: {_ts(g.get('archived_at'))}",
         f"members: {_q(member_str)}",
         "---",
     ]) + "\n"

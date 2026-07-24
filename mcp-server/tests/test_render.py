@@ -63,11 +63,14 @@ class TestRender(unittest.TestCase):
              "created_at": None, "updated_at": None, "sha256": "abc"}
         self.assertIn("sourcetype: file", r.render_source(s, ["h1"]))
         g = {"id": U, "type": "project", "name": "Migration", "description": "d",
-             "participants": ["alice"]}
+             "participants": ["alice"], "archived_at": None}
         out = r.render_group(g, [("page", U, "Deploy")])
         self.assertIn("grouptype: project", out)
         # members line holds ': ' (colon-space) so it must be quoted or the YAML block breaks
         self.assertIn(f'members: "page: {U} — Deploy"', out)
+        self.assertIn("archived: \n", out)               # live group -> empty archived line
+        g["archived_at"] = datetime(2026, 3, 1)
+        self.assertIn("archived: 2026-03-01", r.render_group(g))   # archived -> timestamp round-trips
 
     def test_colon_values_are_quoted(self):
         # a title/description with ': ' must be quoted so Obsidian doesn't read the tail as a nested key

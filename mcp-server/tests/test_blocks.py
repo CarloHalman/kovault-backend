@@ -83,14 +83,54 @@ class TestAnomalies(unittest.TestCase):
         self.assertTrue(any("summary" in w and "description" in w for w in p["warnings"]))
         self.assertNotIn("summary", p["fields"])             # dropped, but now reported
 
-    def test_task_blockers_other_tool_warns(self):
-        p = bl.parse_block(f"---\ntype: task\nid: {TID}\ntitle: X\nblockers: some task\n---")
-        self.assertTrue(any("blockers" in w and "link tool" in w for w in p["warnings"]))
+    def test_blockers_are_a_write_field_now(self):
+        # blockers reconcile via write (task_dependencies) — a recognized field, no "use the link
+        # tool" warning; the value parses to ids and drops the ` — title` label sugar
+        p = bl.parse_block(f"---\ntype: task\nid: {TID}\ntitle: X\nblockers: {PID} — some task\n---")
+        self.assertEqual(p["warnings"], [])
+        self.assertEqual(p["blockers"], [PID])
 
-    def test_empty_other_tool_key_is_quiet(self):
-        # a clean round-trip echoes `blockers:` empty — that must NOT warn
+    def test_empty_junction_key_is_quiet_and_clears(self):
+        # a clean round-trip echoes `blockers:` empty — no warn, and it means "clear all" ([])
         p = bl.parse_block(f"---\ntype: task\nid: {TID}\ntitle: X\nblockers: \n---")
         self.assertEqual(p["warnings"], [])
+        self.assertEqual(p["blockers"], [])              # present-but-empty -> clear the junction
+
+    def test_absent_junction_key_is_left_unchanged(self):
+        p = bl.parse_block(f"---\ntype: task\nid: {TID}\ntitle: X\n---")
+        self.assertNotIn("blockers", p)                  # omitted -> leave the junction untouched
+
+
+class TestJunctionRoundTrips(unittest.TestCase):
+    """The four fields that let `write` fold group/link: members, blockers, sources, archived."""
+
+    def test_group_members_round_trip_ids_only(self):
+        row = {"type": "project", "name": "Kovault", "id": TID, "description": "d",
+               "participants": ["alice"], "archived_at": None}
+        # rendered with labels and (ids_only) both — parse must keep just the entity ids
+        p = bl.parse_block(rnd.render_group(row, members=[("page", PID, "Home"), ("task", HID, "Do")]))
+        self.assertEqual(p["members"], [PID, HID])
+        p2 = bl.parse_block(rnd.render_group(row, members=[("page", PID, "Home")], ids_only=True))
+        self.assertEqual(p2["members"], [PID])
+
+    def test_task_blockers_round_trip(self):
+        row = {"title": "ship", "id": TID, "description": "", "status": "todo",
+               "priority": None, "scope": None, "deadline": None, "responsible": []}
+        p = bl.parse_block(rnd.render_task(row, blockers=[f"{PID} — design", f"{HID} — spec"]))
+        self.assertEqual(p["blockers"], [PID, HID])
+
+    def test_header_sources_parsed(self):
+        text = (f"---\ntype: header\nid: {HID}\npage_id: {PID}\nindex: 0\n"
+                f"title: T\nsources: {TID}, {PID}\n---\nbody")
+        p = bl.parse_block(text)
+        self.assertEqual(p["sources"], [TID, PID])
+        self.assertEqual(p["warnings"], [])              # `sources:` is recognized, not "unknown key"
+
+    def test_group_archived_round_trip(self):
+        live = {"type": "topic", "name": "G", "id": TID, "archived_at": None}
+        self.assertEqual(bl.parse_block(rnd.render_group(live))["archived"], "")   # live -> clear
+        arch = {**live, "archived_at": "2026-03-01T00:00:00+00:00"}
+        self.assertEqual(bl.parse_block(rnd.render_group(arch))["archived"], "2026-03-01T00:00:00+00:00")
 
 
 class TestHeaderBlock(unittest.TestCase):

@@ -244,6 +244,33 @@ def _sync_links(cur, from_kind: str, from_id: str, text: str | None,
     return warnings
 
 
+_UNSET = object()   # "field absent" sentinel — distinct from '' (clear) and a value (set)
+
+
+def _sync_junction(cur, table: str, fixed_col: str, fixed_id: str, other_col: str,
+                   new_ids, exists_table: str | None = None) -> list[str]:
+    """Reconcile a two-column junction (group_links / task_dependencies / header_sources) to
+    `new_ids`: add the missing, delete the gone — the add/remove diff `_sync_links` runs for the
+    `links` table, generalized to any single-other-column junction. `exists_table` (when given) is
+    checked before an insert so a stale id is skipped with a warning, not an FK error. Table/column
+    names are internal constants (never user input), so interpolating them is safe. Returns warnings."""
+    cur.execute(f"SELECT {other_col} FROM {table} WHERE {fixed_col}=%s", (fixed_id,))
+    old = {str(r[other_col]) for r in cur.fetchall()}
+    new = {str(x) for x in (new_ids or [])}
+    warns: list[str] = []
+    for oid in new - old:
+        if exists_table:
+            cur.execute(f"SELECT 1 FROM {exists_table} WHERE id=%s", (oid,))
+            if not cur.fetchone():
+                warns.append(f"skipped {table}: {other_col} {oid} not found")
+                continue
+        cur.execute(f"INSERT INTO {table} ({fixed_col},{other_col}) VALUES (%s,%s) "
+                    "ON CONFLICT DO NOTHING", (fixed_id, oid))
+    for oid in old - new:
+        cur.execute(f"DELETE FROM {table} WHERE {fixed_col}=%s AND {other_col}=%s", (fixed_id, oid))
+    return warns
+
+
 def _embed_row(table: str, row: dict) -> str | None:
     """Compose deterministic text for a searchable row and embed it -> pgvector literal."""
     if table not in et.COMPOSERS:
@@ -784,8 +811,8 @@ def fetch(
         if not t:
             parts.append(f"(task {tid} not found)")
             continue
-        blockers = [r["title"] for r in db().query(
-            "SELECT t.title FROM task_dependencies d JOIN tasks t ON t.id=d.blocker "
+        blockers = [f"{r['id']} — {r['title']}" for r in db().query(
+            "SELECT d.blocker AS id, t.title FROM task_dependencies d JOIN tasks t ON t.id=d.blocker "
             "WHERE d.dependent=%s", (tid,))]
         parts.append(rnd.render_task(t, blockers, _links_of("task", tid)))
     for did in decisions or []:
@@ -1463,9 +1490,12 @@ def _trash_one(cur, table: str, rid: str, user: str, actor: str) -> str:
     return f"trashed {table} {_write_label(dict(row))} ({rid})"
 
 
-def _write_group(cur, rid: str | None, fields: dict, trashed: bool) -> str:
-    """Group ROW create/update from a `type: group` block. Membership + listing stay on the
-    `group` tool (a rendered member roster is labels, not a clean id set to reconcile from)."""
+def _write_group(cur, rid: str | None, fields: dict, trashed: bool,
+                 members=None, archived=_UNSET) -> str:
+    """Group ROW create/update + membership + archive from a `type: group` block. `members`
+    (entity ids; None = leave untouched) reconciles group_links. `archived` ('' clears, a value
+    sets, _UNSET leaves) round-trips archived_at so unarchive is just fetch->clear the line->write.
+    `trashed: true` stays the archive shortcut."""
     if trashed:
         if not rid:
             return "(skip: archiving a group needs an id)"
@@ -1479,16 +1509,23 @@ def _write_group(cur, rid: str | None, fields: dict, trashed: bool) -> str:
         cur.execute("SELECT 1 FROM groups WHERE id=%s", (rid,))
         if not cur.fetchone():
             return f"(error: group id {rid} not found — omit id to create)"
-        if not s:
-            return f"(no change: group {rid})"
-        cur.execute(f"UPDATE groups SET {', '.join(f'{k}=%s' for k in s)} WHERE id=%s",
-                    list(s.values()) + [rid])
-        return f"updated group {rid}"
-    if not s.get("name"):
-        return "(error: a new group needs a name)"
-    cur.execute("INSERT INTO groups (name, type, description, participants) VALUES (%s,%s,%s,%s) RETURNING id",
-                (s.get("name"), s.get("type"), s.get("description"), s.get("participants")))
-    return f'inserted group "{s.get("name")}" ({str(cur.fetchone()["id"])})'
+        if archived is not _UNSET:
+            s["archived_at"] = archived or None       # gap 3: set/clear in the same UPDATE
+        if s:
+            cur.execute(f"UPDATE groups SET {', '.join(f'{k}=%s' for k in s)} WHERE id=%s",
+                        list(s.values()) + [rid])
+        gid, verb = rid, "updated"
+    else:
+        if not s.get("name"):
+            return "(error: a new group needs a name)"
+        cur.execute("INSERT INTO groups (name, type, description, participants) VALUES (%s,%s,%s,%s) RETURNING id",
+                    (s.get("name"), s.get("type"), s.get("description"), s.get("participants")))
+        gid, verb = str(cur.fetchone()["id"]), "inserted"
+        if archived not in (_UNSET, "", None):        # a group created already-archived
+            cur.execute("UPDATE groups SET archived_at=%s WHERE id=%s", (archived, gid))
+    warns = _sync_junction(cur, "group_links", "group_id", gid, "entity_id", members,
+                           exists_table="entities") if members is not None else []
+    return f'{verb} group {_write_label(fields)} ({gid})' + _warns(warns)
 
 
 def _warns(ws: list[str]) -> str:
@@ -1497,6 +1534,22 @@ def _warns(ws: list[str]) -> str:
 
 def _dispatch_block(cur, p: dict, user: str, actor: str) -> str:
     return _dispatch_block_inner(cur, p, user, actor) + _warns(p.get("warnings") or [])
+
+
+def _has_junction(kind: str, p: dict) -> bool:
+    """A junction roster was written on this block (present, even if empty = clear-all)."""
+    return (kind == "task" and "blockers" in p) or (kind == "header" and "sources" in p)
+
+
+def _sync_block_junctions(cur, kind: str, rid: str, p: dict) -> list[str]:
+    """Reconcile a task's blockers / a header's sources after its row was written (gaps 2, 4).
+    Groups are handled inside _write_group. No-op when the block carried no roster."""
+    if kind == "task" and "blockers" in p:
+        ids = [b for b in p["blockers"] if b != rid]     # a task can't block itself
+        return _sync_junction(cur, "task_dependencies", "dependent", rid, "blocker", ids, exists_table="tasks")
+    if kind == "header" and "sources" in p:
+        return _sync_junction(cur, "header_sources", "header_id", rid, "source_id", p["sources"], exists_table="sources")
+    return []
 
 
 def _dispatch_block_inner(cur, p: dict, user: str, actor: str) -> str:
@@ -1511,7 +1564,7 @@ def _dispatch_block_inner(cur, p: dict, user: str, actor: str) -> str:
         cur.execute("DELETE FROM edits WHERE id=%s", (rid,))
         return f"deleted edit {rid}" if cur.rowcount else f"(error: edit id {rid} not found)"
     if kind == "group":
-        return _write_group(cur, rid, fields, p["trashed"])
+        return _write_group(cur, rid, fields, p["trashed"], p.get("members"), p.get("archived", _UNSET))
     if p["trashed"]:
         return _trash_one(cur, table, rid, user, actor) if rid else f"(skip: trash needs an id — {kind})"
     notes, err = _check_enums(table, fields)          # validate/normalize enum values (F5)
@@ -1526,14 +1579,17 @@ def _dispatch_block_inner(cur, p: dict, user: str, actor: str) -> str:
             for k in ("page_id", "index"):
                 upd.pop(k, None)
         upd = _drop_unchanged(cur, table, rid, upd)
-        if not upd:
+        res = _update_one(cur, table, rid, upd, user, actor) if upd else None
+        jwarns = _sync_block_junctions(cur, kind, rid, p)     # blockers / sources (gaps 2, 4)
+        if res is None and not jwarns and not _has_junction(kind, p):
             return f"(no change: {table} {rid})"
-        res = _update_one(cur, table, rid, upd, user, actor)
-        return (f"updated {table} {res[0]} ({rid}){tag}" + _warns(res[1])) if res else f"(error: update failed {rid})"
+        base = f"updated {table} {res[0]} ({rid})" if res else f"updated {table} ({rid})"
+        return base + tag + _warns((res[1] if res else []) + jwarns)
     ins = {k: v for k, v in fields.items() if v is not None}   # let DB defaults/NULL apply on insert
     if kind == "header" and not ins.get("page_id"):
         return "(error: a header block needs page_id to insert — get it from fetch outline)"
     nid, warns = _insert_one(cur, table, ins, user, actor)
+    warns += _sync_block_junctions(cur, kind, nid, p)         # blockers / sources on a fresh row
     return f"inserted {table} {_write_label(ins)} ({nid}){tag}" + _warns(warns)
 
 
@@ -1556,7 +1612,10 @@ def write(blocks: list[str]) -> str:
       for pruning noisy/bad log entries; get the id from read_sql or the export log.
     - Chunk ids come from `fetch(outline=true)` / `lookup(outline_page=…)` — a whole-page fetch
       does not show them. Links: `[text](kind:uuid)` / `[[wikilinks]]` in the body/description as
-      before. Group membership and task blockers still use the `group` / `link` tools.
+      before.
+    - Junction rosters reconcile from the block (present = set to that list, empty = clear all,
+      absent = leave): a task's `blockers:` (dependencies), a group's `members:` (entity ids), a
+      header's `sources:` (source ids). A group's `archived:` sets/clears its archived state.
     """
     user, actor = _identity()
     parsed, lines = [], []

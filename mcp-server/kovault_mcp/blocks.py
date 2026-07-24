@@ -39,15 +39,21 @@ FIELD_MAP = {
 # columns rendered as a ", "-joined list (render._list) -> split back to a list.
 _ARRAY_COLS = {"responsible", "participants", "contributors"}
 
+# Junction-table id rosters a `write` block carries and the server reconciles (not FIELD_MAP
+# columns): task blockers -> task_dependencies, group members -> group_links, header sources ->
+# header_sources. Rendered as an id list; parse keeps the ids and drops any kind/label sugar.
+# Key present -> reconcile to that set (empty value clears all); key absent -> leave unchanged.
+_JUNCTION_KEYS = {"task": "blockers", "group": "members", "header": "sources"}
+
 # --- anomaly detection (F: no silent failures) -----------------------------------------
 # Keys `fetch` echoes that are read-only metadata or derived from other data — silently
 # ignored on write (a full round-trip includes them; warning on each would be noise).
 _META_KEYS = {"id", "type", "trashed", "created", "updated", "completed", "related",
               "referenced by"}
-# Keys that carry REAL data but are written through a different tool, not `write`. A non-empty
-# value here is dropped, so it must be reported (e.g. a task's `blockers:` was silently eaten).
-_OTHER_TOOL = {"blockers": "the link tool (task_dependencies)",
-               "members": "the group tool (add/remove)"}
+# Keys that carry REAL data written through a different tool, not `write`. Empty now that
+# blockers/members are first-class write fields (see _JUNCTION_KEYS); kept as the guard point
+# if a field is ever moved back out of write.
+_OTHER_TOOL: dict[str, str] = {}
 # DB column name a user might type instead of the template key (old insert/update API shape).
 # Auto-derived: any FIELD_MAP entry whose column differs from its template key.
 _RENAME_HINTS = {kind: {col: key for key, col in m.items() if col != key}
@@ -59,6 +65,10 @@ def _detect_anomalies(kind: str, raw: dict) -> list[str]:
     column names) and other-tool keys carrying a value. Recognized writable + metadata keys
     stay quiet so a clean round-trip reports nothing."""
     recognized = set(FIELD_MAP[kind]) | _META_KEYS
+    if kind in _JUNCTION_KEYS:                 # blockers/members/sources: reconciled, not dropped
+        recognized.add(_JUNCTION_KEYS[kind])
+    if kind == "group":                        # archived round-trip (set/clear archived_at)
+        recognized.add("archived")
     hints = _RENAME_HINTS.get(kind, {})
     warns: list[str] = []
     for key, val in raw.items():
@@ -92,6 +102,23 @@ def _unquote(v: str) -> str:
                 i += 1
         return "".join(out)
     return v
+
+
+def _looks_uuid(x: str) -> bool:
+    return len(x) == 36 and x.count("-") == 4
+
+
+def _id_list(value: str | None) -> list[str]:
+    """Parse a rendered junction roster into entity ids. Handles every render shape:
+    'kind: id — label, ...' (members), 'id — title, ...' (blockers), 'id, ...' (sources) — take
+    the first uuid-looking token of each comma segment; kind/label sugar is dropped."""
+    ids: list[str] = []
+    for seg in (value or "").split(","):
+        for tok in seg.replace(":", " ").split():
+            if _looks_uuid(tok):
+                ids.append(tok)
+                break
+    return ids
 
 
 def _split(text: str) -> tuple[list[str], str]:
@@ -147,5 +174,11 @@ def parse_block(text: str) -> dict:
         fields["body"] = body or None
     trashed = (raw.get("trashed", "").strip().lower() in ("true", "yes", "1")
                or (kind == "page" and raw.get("freshness") == "trashed"))
-    return {"kind": kind, "table": TABLE[kind], "id": raw.get("id") or None,
-            "fields": fields, "trashed": trashed, "warnings": _detect_anomalies(kind, raw)}
+    out = {"kind": kind, "table": TABLE[kind], "id": raw.get("id") or None,
+           "fields": fields, "trashed": trashed, "warnings": _detect_anomalies(kind, raw)}
+    jkey = _JUNCTION_KEYS.get(kind)             # present -> reconcile that junction (empty clears all)
+    if jkey and jkey in raw:
+        out[jkey] = _id_list(raw[jkey])
+    if kind == "group" and "archived" in raw:   # present+value -> set archived_at, present+empty -> clear
+        out["archived"] = raw["archived"].strip()
+    return out
