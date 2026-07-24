@@ -149,6 +149,11 @@ class TestClassifyAndValues(unittest.TestCase):
         with self.assertRaises(bl.BlockError):
             bl.parse_block("---\ntype: task\nno closing fence")
 
+    def test_duplicate_key_raises(self):
+        # a stray second `type:` (grouptype was meant) must not silently overwrite the marker
+        with self.assertRaises(bl.BlockError):
+            bl.parse_block("---\ntype: group\nname: x\ntype: topic\n---")
+
 
 if __name__ == "__main__":
     unittest.main()

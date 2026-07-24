@@ -109,13 +109,19 @@ def _split(text: str) -> tuple[list[str], str]:
 
 def _frontmatter(fm_lines: list[str]) -> dict:
     """Parse `key: value` lines. Keys never contain ':' (render owns them), so partition on the
-    FIRST ':' is exact even when the (quoted) value contains one."""
+    FIRST ':' is exact even when the (quoted) value contains one. A duplicate key is rejected, not
+    last-wins: a stray second `type:` (e.g. `type: topic` where `grouptype:` was meant) would
+    silently overwrite the kind marker, misclassify the block as a page, and fail later with a
+    cryptic wrong-table error. Reject early with a clear message instead."""
     raw: dict = {}
     for ln in fm_lines:
         if not ln.strip() or ":" not in ln:
             continue
         key, _, rest = ln.partition(":")
-        raw[key.strip()] = _unquote(rest.strip())
+        k = key.strip()
+        if k in raw:
+            raise BlockError(f"duplicate key '{k}' in block frontmatter")
+        raw[k] = _unquote(rest.strip())
     return raw
 
 
