@@ -98,7 +98,7 @@ class TestBundleLayout(unittest.TestCase):
     def _rows(self):
         return {
             "pages": [{"id": U, "title": "Alpha: one", "summary": "s", "type": "note",
-                       "freshness": "hot", "created_at": None, "updated_at": None,
+                       "lifecycle": "live", "created_at": None, "updated_at": None,
                        "contributors": []}],
             "tasks": [{"id": U, "title": "Do X", "description": "d", "status": "done",
                        "priority": "low", "scope": "days", "created_at": None,
@@ -120,7 +120,7 @@ class TestBundleLayout(unittest.TestCase):
         paths = _bundle_paths(self._rows())
         d = datetime(2026, 7, 6)
         wk = f"{d.isocalendar()[0]}-W{d.isocalendar()[1]:02d}"
-        self.assertIn("pages/note/alpha-one.md", paths)   # no freshness subfolder
+        self.assertIn("pages/note/alpha-one.md", paths)   # bucketed by page type, not by state
         self.assertIn("tasks/done/do-x.md", paths)
         self.assertIn(f"decisions/{wk}/pick-y.md", paths)
         self.assertIn("sources/file/md/my-notes.md", paths)   # file source split by extension

@@ -6,8 +6,11 @@
 -- Ids: gen_random_uuid() (PG16 built-in). Time-ordering comes from created_at, not the uuid.
 -- Container load order: 01-schema.sql (this file), then 02-init.sql (settings seed) — see docker-compose.yml.
 --
--- Trash model: nothing is ever hard-deleted. Pages trash via freshness='trashed';
--- headers/tasks/decisions/sources trash via trashed_at. Every trash logs an edits row.
+-- Lifecycle model (E3), identical on every content table (pages, headers, tasks, decisions,
+-- sources, groups): `trashed_at` (null = live) is the ONE trash marker — nothing is ever
+-- hard-deleted — and `lifecycle` (live/archived/static) is the orthogonal state. Every trash,
+-- revive and lifecycle change logs an edits row and, being a state-only write, leaves
+-- updated_at alone (see the set_updated_at() trigger at the bottom of this file).
 
 -- ---------------- Extensions ----------------
 CREATE EXTENSION IF NOT EXISTS vector;      -- pgvector (halfvec)
@@ -28,9 +31,9 @@ CREATE TYPE change_operation AS ENUM ('insert', 'update', 'trash');   -- nothing
 CREATE TYPE actor_kind       AS ENUM ('self', 'ai', 'script');
 CREATE TYPE task_status      AS ENUM ('todo', 'doing', 'done');
 CREATE TYPE task_priority    AS ENUM ('low', 'medium', 'high', 'urgent');
-CREATE TYPE task_scope       AS ENUM ('minutes', 'hours', 'days', 'weeks');
-CREATE TYPE page_freshness   AS ENUM ('hot', 'warm', 'cold', 'static', 'archived', 'trashed');
+CREATE TYPE lifecycle_kind   AS ENUM ('live', 'archived', 'static');  -- E3: same on every content table
 CREATE TYPE group_types      AS ENUM ('project', 'topic', 'area');
+CREATE TYPE group_status     AS ENUM ('active', 'completed', 'idle');  -- nullable on groups; aimed at type: project (E2)
 CREATE TYPE link_kind        AS ENUM ('page', 'header', 'task', 'decision', 'source');
 
 -- ---------------- Tables ----------------
@@ -45,11 +48,13 @@ CREATE TABLE groups (
   id           uuid          PRIMARY KEY DEFAULT gen_random_uuid(),
   created_at   timestamptz   NOT NULL DEFAULT now(),
   updated_at   timestamptz   NOT NULL DEFAULT now(),
+  trashed_at   timestamptz,                             -- null = live (E3)
+  lifecycle    lifecycle_kind NOT NULL DEFAULT 'live',  -- archived drops it from default lists (E3)
   name         varchar(64)   NOT NULL,
   type         group_types   NOT NULL,                  -- loose, flexible categories
   description  varchar(512),
   participants varchar(64)[],
-  archived_at  timestamptz                              -- null = live; set by group archive (drops from default lists)
+  status       group_status                             -- nullable, no default; workflow state (E2), aimed at type: project
 );
 
 CREATE TABLE group_links (
@@ -64,6 +69,7 @@ CREATE TABLE sources (
   created_at        timestamptz NOT NULL DEFAULT now(),
   updated_at        timestamptz NOT NULL DEFAULT now(),
   trashed_at        timestamptz,                         -- null = live
+  lifecycle         lifecycle_kind NOT NULL DEFAULT 'live',
   type              source_type NOT NULL,
   title             varchar(64),
   reference         varchar(256) NOT NULL,               -- url, path
@@ -79,6 +85,7 @@ CREATE TABLE decisions (
   created_at  timestamptz  NOT NULL DEFAULT now(),
   updated_at  timestamptz  NOT NULL DEFAULT now(),
   trashed_at  timestamptz,
+  lifecycle   lifecycle_kind NOT NULL DEFAULT 'live',
   title       varchar(64) NOT NULL,
   description varchar(1024),
   decided_by  varchar(64),
@@ -105,11 +112,12 @@ CREATE TABLE tasks (
   created_at  timestamptz   NOT NULL DEFAULT now(),
   updated_at  timestamptz   NOT NULL DEFAULT now(),
   trashed_at  timestamptz,
+  lifecycle   lifecycle_kind NOT NULL DEFAULT 'live',
   title       varchar(64)  NOT NULL,
   description varchar(1024),
   status      task_status   NOT NULL DEFAULT 'todo',
   priority    task_priority,                             -- nullable (F4): unset != a deliberate 'medium'
-  scope       task_scope,                                -- nullable (F4): unset != a deliberate 'minutes'
+  scope       varchar(16),                               -- freeform (E1), nullable: no closed set, unset != a deliberate value
   deadline    timestamptz,
   completed_at timestamptz,                              -- stamped by trigger when status -> done (F4)
   responsible varchar(64)[],                             -- free names; may name people without Kovault access
@@ -129,10 +137,11 @@ CREATE TABLE pages (
   id           uuid           PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
   created_at   timestamptz    NOT NULL DEFAULT now(),
   updated_at   timestamptz    NOT NULL DEFAULT now(),
+  trashed_at   timestamptz,                              -- null = live (E3; was freshness='trashed')
+  lifecycle    lifecycle_kind NOT NULL DEFAULT 'live',   -- archived drops out of lookup (E3)
   title        varchar(64)   NOT NULL,                  -- feeds every chunk's path + embedding
   summary      varchar(512),
   type         varchar(32),                              -- OKF-style: free descriptive value
-  freshness    page_freshness NOT NULL DEFAULT 'hot',    -- 'trashed' = page's trash marker
   contributors varchar(64)[]                             -- append-only
 );
 
@@ -141,6 +150,7 @@ CREATE TABLE headers (
   created_at  timestamptz NOT NULL DEFAULT now(),
   updated_at  timestamptz NOT NULL DEFAULT now(),
   trashed_at  timestamptz,
+  lifecycle   lifecycle_kind NOT NULL DEFAULT 'live',
   page_id     uuid        NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
   title       varchar(64),                              -- short label; models keep titles <=64 (formatting rule in CLAUDE.md), full heading lives in body
   index       int         NOT NULL,                      -- position on page
@@ -228,11 +238,14 @@ CREATE INDEX ON headers USING gin (title gin_trgm_ops);
 
 -- Normalized-title trigram indexes for the fuzzy keyword arm (F2). The `%`/similarity() probes in
 -- _trigram_hits use these; without them each is a seq-scan.
-CREATE INDEX ON headers   USING gin (title_norm gin_trgm_ops);
-CREATE INDEX ON headers   USING gin (blurb_norm gin_trgm_ops);
-CREATE INDEX ON tasks     USING gin (title_norm gin_trgm_ops);
-CREATE INDEX ON decisions USING gin (title_norm gin_trgm_ops);
-CREATE INDEX ON sources   USING gin (title_norm gin_trgm_ops);
+-- Named explicitly to match migrate_1.3.0.sql. `CREATE INDEX ON` auto-names to *_title_norm_idx,
+-- so a FRESH install and a MIGRATED one ended up with different names for the same index, and a
+-- later migration dropping one by name would silently no-op on half the installs.
+CREATE INDEX headers_title_norm_trgm   ON headers   USING gin (title_norm gin_trgm_ops);
+CREATE INDEX headers_blurb_norm_trgm   ON headers   USING gin (blurb_norm gin_trgm_ops);
+CREATE INDEX tasks_title_norm_trgm     ON tasks     USING gin (title_norm gin_trgm_ops);
+CREATE INDEX decisions_title_norm_trgm ON decisions USING gin (title_norm gin_trgm_ops);
+CREATE INDEX sources_title_norm_trgm   ON sources   USING gin (title_norm gin_trgm_ops);
 
 -- ---------------- Keyword indexes (pg_search bm25) ----------------
 CREATE INDEX ON headers   USING bm25 (id, title, blurb, body)         WITH (key_field='id');
@@ -246,23 +259,19 @@ CREATE INDEX ON sources   USING bm25 (id, title, summary, reference)  WITH (key_
 -- No AGE: identical scores at Kovault scale, no custom image, no projection sync (BUILD.md B5).
 
 -- ---------------- updated_at trigger ----------------
+-- The updated_at rule (E3): a CONTENT write bumps updated_at; a STATE-ONLY write (trash, revive,
+-- lifecycle change, every janitor pass) must not — otherwise a state flip makes the row look
+-- "changed this week" and marks it embed-stale via `embedded_at < updated_at` (embed_worker.py).
+-- The writer declares its own intent with `SET LOCAL kovault.state_only = 'on'` around the
+-- statement; the trigger does not try to guess. A per-table "did a content column change?" test
+-- would be the hand-maintained field list this release deletes everywhere else, and doing it
+-- generically (to_jsonb(OLD) vs to_jsonb(NEW)) would serialize a halfvec(4000) on every UPDATE.
+-- SET LOCAL is transaction-scoped and every server write runs in a transaction (db.py opens the
+-- pool with autocommit=False), so the flag can never leak to the next borrower of the connection.
+-- A hand-written UPDATE from psql sets no flag and therefore bumps updated_at — the right default.
 CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger AS $$
 BEGIN
-  NEW.updated_at = now();
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
--- Pages need a variant: a freshness-only change (the /janitor -freshness recompute) must NOT
--- reset updated_at, or the age that freshness is derived from erases itself and every rerun
--- marks pages 'hot'. Any real content edit (title/summary/type/contributors) still bumps it.
-CREATE OR REPLACE FUNCTION set_updated_at_pages() RETURNS trigger AS $$
-BEGIN
-  IF NEW.freshness     IS DISTINCT FROM OLD.freshness
-     AND NEW.title        IS NOT DISTINCT FROM OLD.title
-     AND NEW.summary      IS NOT DISTINCT FROM OLD.summary
-     AND NEW.type         IS NOT DISTINCT FROM OLD.type
-     AND NEW.contributors IS NOT DISTINCT FROM OLD.contributors THEN
+  IF coalesce(current_setting('kovault.state_only', true), '') = 'on' THEN
     NEW.updated_at = OLD.updated_at;
   ELSE
     NEW.updated_at = now();
@@ -271,7 +280,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER trg_pages_updated     BEFORE UPDATE ON pages     FOR EACH ROW EXECUTE FUNCTION set_updated_at_pages();
+CREATE TRIGGER trg_pages_updated     BEFORE UPDATE ON pages     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 CREATE TRIGGER trg_headers_updated   BEFORE UPDATE ON headers   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 CREATE TRIGGER trg_tasks_updated     BEFORE UPDATE ON tasks     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 CREATE TRIGGER trg_decisions_updated BEFORE UPDATE ON decisions FOR EACH ROW EXECUTE FUNCTION set_updated_at();

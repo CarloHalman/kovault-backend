@@ -1,7 +1,12 @@
 # Standalone embedding service (compose project `embedding`) — its own group, on purpose.
 # This is a generic OpenAI-compatible embedding endpoint (Ollama). It is NOT Kovault-specific:
-# any app can point at http://<host>:11434/v1. Kovault's kovault-mcp reaches it via the host
-# (host.docker.internal:11434) using the endpoint stored in the DB `embedding` setting.
+# any app that joins `kovault-net` can point at http://embedding:11434/v1.
+#
+# NO PUBLISHED PORT, deliberately. Ollama has no authentication of any kind: a host port buys
+# nothing that the shared network does not already give kovault-mcp, and would hand your GPU and
+# model store to anyone who can reach the machine. Containers that need it join kovault-net and
+# resolve it by service name. To reach it from the host for debugging, use
+# `docker compose exec embedding ...` or publish a port temporarily.
 #
 # GPU is used only WHILE embedding (OLLAMA_KEEP_ALIVE frees VRAM after), not 24/7.
 # Drop the `deploy.resources` block to run CPU-only.
@@ -17,8 +22,8 @@ services:
       OLLAMA_MAX_LOADED_MODELS: "1"
     volumes:
       - ollama-models:/root/.ollama
-    ports:
-      - "11434:11434"
+    networks:
+      - kovault-net
     deploy:
       resources:
         reservations:
@@ -29,3 +34,10 @@ services:
 
 volumes:
   ollama-models:
+
+networks:
+  # Shared with the kovault project so kovault-mcp can reach http://embedding:11434 without any
+  # host port. External (rather than owned by one of the two projects) so neither has to be
+  # started before the other:  docker network create kovault-net
+  kovault-net:
+    external: true

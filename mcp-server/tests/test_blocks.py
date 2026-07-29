@@ -58,14 +58,14 @@ class TestRoundTrip(unittest.TestCase):
 
     def test_page_detected_by_exclusion(self):
         page = {"type": "note", "title": "Home", "id": PID, "summary": "hub",
-                "created_at": None, "updated_at": None, "freshness": "hot",
+                "created_at": None, "updated_at": None, "lifecycle": "live",
                 "contributors": ["alice"]}
         headers = [{"title": "Intro", "body": "hello", "page_id": PID, "index": 0}]
         p = bl.parse_block(rnd.render_page(page, headers))
         self.assertEqual(p["kind"], "page")
         self.assertEqual(p["fields"]["type"], "note")       # page type preserved
         self.assertEqual(p["fields"]["summary"], "hub")     # description -> summary
-        self.assertEqual(p["fields"]["freshness"], "hot")
+        self.assertEqual(p["fields"]["lifecycle"], "live")
         self.assertEqual(p["fields"]["contributors"], ["alice"])  # now rewritable (A2)
         self.assertEqual(p["warnings"], [])                  # clean round-trip => no anomalies
 
@@ -102,11 +102,11 @@ class TestAnomalies(unittest.TestCase):
 
 
 class TestJunctionRoundTrips(unittest.TestCase):
-    """The four fields that let `write` fold group/link: members, blockers, sources, archived."""
+    """The four fields that let `write` fold group/link: members, blockers, sources, lifecycle."""
 
     def test_group_members_round_trip_ids_only(self):
         row = {"type": "project", "name": "Kovault", "id": TID, "description": "d",
-               "participants": ["alice"], "archived_at": None}
+               "participants": ["alice"], "lifecycle": "live"}
         # rendered with labels and (ids_only) both — parse must keep just the entity ids
         p = bl.parse_block(rnd.render_group(row, members=[("page", PID, "Home"), ("task", HID, "Do")]))
         self.assertEqual(p["members"], [PID, HID])
@@ -126,11 +126,67 @@ class TestJunctionRoundTrips(unittest.TestCase):
         self.assertEqual(p["sources"], [TID, PID])
         self.assertEqual(p["warnings"], [])              # `sources:` is recognized, not "unknown key"
 
-    def test_group_archived_round_trip(self):
-        live = {"type": "topic", "name": "G", "id": TID, "archived_at": None}
-        self.assertEqual(bl.parse_block(rnd.render_group(live))["archived"], "")   # live -> clear
-        arch = {**live, "archived_at": "2026-03-01T00:00:00+00:00"}
-        self.assertEqual(bl.parse_block(rnd.render_group(arch))["archived"], "2026-03-01T00:00:00+00:00")
+    def test_group_lifecycle_round_trip(self):
+        live = {"type": "topic", "name": "G", "id": TID, "lifecycle": "live"}
+        self.assertEqual(bl.parse_block(rnd.render_group(live))["fields"]["lifecycle"], "live")
+        arch = {**live, "lifecycle": "archived"}
+        p = bl.parse_block(rnd.render_group(arch))
+        self.assertEqual(p["fields"]["lifecycle"], "archived")
+        self.assertEqual(p["warnings"], [])              # `lifecycle:` is a first-class group field
+
+
+class TestJunctionDeltaKeys(unittest.TestCase):
+    """D1: `<roster>_add:` / `<roster>_remove:` beside the full roster key, on all three junctions."""
+
+    def test_delta_keys_recognized_no_unknown_key_warning(self):
+        for text in (
+            f"---\ntype: task\nid: {TID}\ntitle: X\nblockers_add: {PID}\n---",
+            f"---\ntype: task\nid: {TID}\ntitle: X\nblockers_remove: {PID}\n---",
+            f"---\ntype: group\nid: {TID}\nname: G\nmembers_add: {PID}\n---",
+            f"---\ntype: group\nid: {TID}\nname: G\nmembers_remove: {PID}\n---",
+            f"---\ntype: header\nid: {HID}\npage_id: {PID}\nindex: 0\ntitle: T\nsources_add: {TID}\n---\nbody",
+            f"---\ntype: header\nid: {HID}\npage_id: {PID}\nindex: 0\ntitle: T\nsources_remove: {TID}\n---\nbody",
+        ):
+            self.assertEqual(bl.parse_block(text)["warnings"], [], text)
+
+    def test_add_and_remove_ids_extracted(self):
+        p = bl.parse_block(f"---\ntype: task\nid: {TID}\ntitle: X\n"
+                            f"blockers_add: {PID}\nblockers_remove: {HID}\n---")
+        self.assertEqual(p["blockers_add"], [PID])
+        self.assertEqual(p["blockers_remove"], [HID])
+        self.assertNotIn("blockers", p)                  # delta only -> no full-roster key
+
+    def test_full_roster_and_delta_together_is_an_error(self):
+        with self.assertRaises(bl.BlockError):
+            bl.parse_block(f"---\ntype: group\nid: {TID}\nname: G\n"
+                            f"members: {PID}\nmembers_add: {HID}\n---")
+
+    def test_error_names_both_keys(self):
+        try:
+            bl.parse_block(f"---\ntype: group\nid: {TID}\nname: G\n"
+                            f"members: {PID}\nmembers_remove: {HID}\n---")
+            self.fail("expected BlockError")
+        except bl.BlockError as e:
+            self.assertIn("members", str(e))
+            self.assertIn("members_remove", str(e))
+
+    def test_add_and_remove_together_without_full_roster_is_fine(self):
+        p = bl.parse_block(f"---\ntype: group\nid: {TID}\nname: G\n"
+                            f"members_add: {PID}\nmembers_remove: {HID}\n---")
+        self.assertEqual(p["warnings"], [])
+        self.assertEqual(p["members_add"], [PID])
+        self.assertEqual(p["members_remove"], [HID])
+
+    def test_empty_delta_value_is_a_no_op_warning(self):
+        p = bl.parse_block(f"---\ntype: task\nid: {TID}\ntitle: X\nblockers_add: \n---")
+        self.assertEqual(p["blockers_add"], [])
+        self.assertTrue(any("blockers_add" in w and "empty" in w for w in p["warnings"]))
+
+    def test_empty_full_roster_still_clears_quietly(self):
+        # unchanged behaviour (regression guard): empty `members:` is a deliberate clear-all, no warn
+        p = bl.parse_block(f"---\ntype: group\nid: {TID}\nname: G\nmembers: \n---")
+        self.assertEqual(p["members"], [])
+        self.assertEqual(p["warnings"], [])
 
 
 class TestHeaderBlock(unittest.TestCase):
@@ -173,9 +229,26 @@ class TestClassifyAndValues(unittest.TestCase):
         self.assertEqual(bl._unquote("plain"), "plain")
 
     def test_trashed_flags(self):
+        # one trash marker for every kind (E3): `trashed: true`, no page-only freshness path
         self.assertTrue(bl.parse_block(f"---\ntype: task\nid: {TID}\ntrashed: true\n---")["trashed"])
-        self.assertTrue(bl.parse_block(f"---\ntype: note\nid: {PID}\nfreshness: trashed\n---")["trashed"])
+        self.assertTrue(bl.parse_block(f"---\ntype: note\nid: {PID}\ntrashed: true\n---")["trashed"])
         self.assertFalse(bl.parse_block(f"---\ntype: task\nid: {TID}\nstatus: done\n---")["trashed"])
+
+    def test_trashed_is_tri_state(self):
+        # absent -> leave the state alone; present-but-empty/false -> revive (clear trashed_at)
+        self.assertNotIn("revive", bl.parse_block(f"---\ntype: task\nid: {TID}\ntitle: X\n---"))
+        self.assertTrue(bl.parse_block(f"---\ntype: task\nid: {TID}\ntrashed: \n---")["revive"])
+        self.assertTrue(bl.parse_block(f"---\ntype: task\nid: {TID}\ntrashed: false\n---")["revive"])
+        self.assertNotIn("revive", bl.parse_block(f"---\ntype: task\nid: {TID}\ntrashed: true\n---"))
+
+    def test_trash_state_survives_a_round_trip(self):
+        # a trashed row fetched and written back unchanged stays trashed (not silently revived)
+        trashed = {"title": "X", "id": TID, "trashed_at": "2026-03-01T00:00:00+00:00"}
+        p = bl.parse_block(rnd.render_task(trashed))
+        self.assertTrue(p["trashed"])
+        self.assertNotIn("revive", p)
+        self.assertNotIn("revive", bl.parse_block(rnd.render_group(
+            {"name": "G", "id": TID, "trashed_at": "2026-03-01T00:00:00+00:00"})))
 
     def test_edit_kind_delete(self):
         p = bl.parse_block(f"---\ntype: edit\nid: {TID}\ntrashed: true\n---")
@@ -210,7 +283,7 @@ class TestConcatenatedTemplates(unittest.TestCase):
     def test_full_page_render_still_parses(self):
         # a fetched full page renders its chunks WITHOUT fences -> not a concatenation, must parse
         page = {"type": "note", "title": "Home", "id": PID, "summary": "hub",
-                "created_at": None, "updated_at": None, "freshness": "hot", "contributors": []}
+                "created_at": None, "updated_at": None, "lifecycle": "live", "contributors": []}
         headers = [{"title": "Intro", "body": "hello", "page_id": PID, "index": 0}]
         self.assertEqual(bl.parse_block(rnd.render_page(page, headers))["kind"], "page")
 

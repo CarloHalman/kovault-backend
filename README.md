@@ -1,9 +1,9 @@
 # Kovault backend
 
-Self-hosted backend for Kovault, holds the Postgres database and the DB credentials. ParadeDB
-(PostgreSQL 16 + pgvector + pg_search + pg_trgm) plus the **kovault-mcp** server that the
-[Kovault plugin](https://github.com/CarloHalman/kovault) talks to; a hybrid semantic + keyword +
-graph index. Install this once on your server, then point the plugin at its HTTP endpoint.
+Self-hosted backend for Kovault. Holds Postgres and the DB credentials. ParadeDB (PostgreSQL 16 +
+pgvector + pg_search + pg_trgm) plus the **kovault-mcp** server that the
+[Kovault plugin](https://github.com/CarloHalman/kovault) talks to. Hybrid semantic + keyword +
+graph index. Install once on your server, point plugin at its HTTP endpoint.
 
 ```bash
 git clone https://github.com/CarloHalman/kovault-backend
@@ -13,91 +13,92 @@ cd kovault-backend
 ## Prerequisites
 
 - **Docker + Docker Compose.**
-- **An embedding endpoint** the `kovault-mcp` container can reach, exposing an **OpenAI-compatible
-  `/v1/embeddings`** API. Either:
-  - Run the standalone [`embedding/`](embedding/) service in this repo (its own compose project,
-    reusable by other apps) — see step 3 below, or
-  - Point at any existing OpenAI-compatible endpoint (an Ollama you already run, a dedicated
-    **Qwen3-Embedding-8B** server MRL-projected to **4000** dims, another box, …).
+- **Embedding endpoint** reachable from the `kovault-mcp` container, OpenAI-compatible
+  **`/v1/embeddings`**, model emitting **at least 4000 dimensions** (step 3). Bundled
+  [`embedding/`](embedding/) service or your own.
 
-## 1. Set the DB password
+## 1. Create the shared network
+
+Both compose projects join it, so `kovault-mcp` reaches the embedder without publishing a port for
+it. Once:
+
+```bash
+docker network create kovault-net
+```
+
+## 2. Set the secrets
 
 ```bash
 cd docker
-cp secrets/kovault_db_password.txt.example secrets/kovault_db_password.txt
-# edit secrets/kovault_db_password.txt to a real password
+cp secrets/kovault_db_password.txt.example secrets/kovault_db_password.txt   # a real password
+cp secrets/kovault_auth_token.txt.example  secrets/kovault_auth_token.txt    # a long random string
 ```
 
-## 2. Match the vector dimension to your embedding model
+Auth token guards **every** route: tool surface, zip export, everything. Empty file runs without
+authentication. Server starts either way and says loudly at every boot which of the two you chose.
+**File must exist**, or compose refuses to start.
 
-The embedding **columns are fixed at schema creation**, so `halfvec(N)` must equal your model's
-output dim. Default is `halfvec(4000)` (Qwen3-8B MRL). If you use `qwen3-embedding:4b` (1024):
+## 3. Embedding
+
+Needs an OpenAI-compatible `/v1/embeddings` endpoint, model emitting **at least 4000 dimensions**.
+Bundled service or your own.
+
+Setup, models, the `embedding` setting, why the bundled one publishes no host port:
+**[`embedding/README.md`](embedding/README.md)**.
+
+## 4. Choose what the ports are exposed to
 
 ```bash
-sed -i 's/halfvec(4000)/halfvec(1024)/g' docker/01-schema.sql   # do this BEFORE first boot
+cd docker
+cp .env.example .env
 ```
 
-Then set the endpoint/model/dims that the server calls, in `docker/02-init.sql`:
+Binds to **`127.0.0.1` by default, this machine only**. To reach the vault from another machine,
+set `KOVAULT_BIND` in `.env` to a specific interface address (VPN or LAN address, far better than
+`0.0.0.0`), and **set an auth token first**. Past loopback, anyone who can route to the port can
+read and write the entire vault and download it as a zip.
 
-```sql
-('embedding', '{"model": "qwen3-embedding:4b", "endpoint": "http://<embed-host>:11434/v1", "dims": 1024}')
-```
-
-(`endpoint` is the base URL; the server calls `<endpoint>/v1/embeddings`. The default
-`http://host.docker.internal:11434` reaches an embedding published on the host at :11434. `dims`
-must match the `halfvec(N)` you set.)
-
-## 3. Embedding — point at your own, or run one alongside
-
-Kovault needs an OpenAI-compatible embedding endpoint. **Choose one:**
-
-- **(A) Use an embedding you already run** — an existing Ollama, a shared box, any
-  `/v1/embeddings` server. Just set its URL in step 2; skip the rest of this step.
-- **(B) Run the bundled one alongside Kovault** — it lives in its **own** compose project
-  (`embedding/`), on purpose, so it stays reusable by other apps too:
-
-  ```bash
-  cd embedding
-  docker compose up -d
-  docker compose exec embedding ollama pull qwen3-embedding:8b   # a model >= 4000 output dims
-  ```
-
-Either way, the endpoint you chose goes in the `embedding` setting (step 2). Default
-`http://host.docker.internal:11434` reaches an embedding published on the host at :11434.
-
-## 4. Build and run Kovault
+## 5. Build and run Kovault
 
 ```bash
 cd docker
 docker compose up --build
 ```
 
-Brings up the `kovault` project (kovault-db + kovault-mcp, grouped together). First boot runs
-`01-schema.sql` then `02-init.sql` automatically. The DB image is `paradedb/paradedb` (pgvector +
-pg_search prebuilt); pg_trgm is stock contrib.
+Brings up the `kovault` project (kovault-db + kovault-mcp, grouped). First boot runs `01-schema.sql`
+then `02-init.sql` automatically. DB image is `paradedb/paradedb` (pgvector + pg_search prebuilt);
+pg_trgm is stock contrib.
 
-## 5. Verify
+## 6. Verify
 
 ```bash
 docker compose exec kovault-db psql -U kovault -d kovault -c "\dx"            # vector + pg_search + pg_trgm
 docker compose exec kovault-db psql -U kovault -d kovault -c "SELECT key FROM settings;"
 ```
 
-The MCP server is now serving at **`http://<your-host>:8000/mcp`**. That URL is what you give
-the plugin's `/kovault:setup`.
+MCP server now serves at **`http://127.0.0.1:8000/mcp`** (or whatever `KOVAULT_BIND` says). Give
+that URL to the plugin's `/kovault:setup`, which finishes the job: writes a row and confirms it
+becomes searchable, the only thing proving the embedder is wired up.
 
-## 6. Identity headers
+## 7. Identity headers
 
-The server reads `X-Kovault-User` / `X-Kovault-Actor` HTTP headers (the plugin's `/kovault:setup`
-sets these) to stamp edits. You can set fallbacks with `KOVAULT_DEFAULT_USER` /
-`KOVAULT_DEFAULT_ACTOR` env on the `kovault-mcp` service.
+Server reads `X-Kovault-User` / `X-Kovault-Actor` HTTP headers (plugin's `/kovault:setup` sets
+these) to stamp edits. Fallbacks: `KOVAULT_DEFAULT_USER` / `KOVAULT_DEFAULT_ACTOR` env on the
+`kovault-mcp` service.
+
+## Upgrading
+
+Your version is `version` in `mcp-server/pyproject.toml`. Read
+[`CHANGELOG.md`](CHANGELOG.md): one section per release, with
+breaking changes and migration steps. Read **every** section between your version and this one, not
+only the newest, migrations stack.
+
+Raw diff instead: releases are tagged, so `git diff v1.4.1..v1.5.0` (or GitHub's compare view) shows
+everything that changed.
 
 ## Notes
 
-- **Change the embedding model later?** Re-point the `embedding` setting, keep `dims` matching
-  the `halfvec(N)`, then run `/kovault:janitor -embed` to re-embed everything. Changing dims
-  means a schema change + full re-ingest.
-- **BM25 (pg_search)** is the one API that varies across ParadeDB releases; if keyword search
-  errors, confirm the `USING bm25 (...) WITH (key_field='id')` indexes and the `col @@@ 'terms'`
-  / `paradedb.score(id)` calls against your pinned pg_search version. Vector + graph are stock.
-- Only `kovault-mcp` holds DB credentials; users' plugins only ever talk to its HTTP endpoint.
+- **BM25 (pg_search)** is the one API varying across ParadeDB releases. Keyword search errors:
+  confirm the `USING bm25 (...) WITH (key_field='id')` indexes and the `col @@@ 'terms'` /
+  `paradedb.score(id)` calls against your pinned pg_search version. Vector + graph are stock.
+- Only `kovault-mcp` holds DB credentials. Users' plugins only ever talk to its HTTP endpoint.

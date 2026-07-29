@@ -25,8 +25,20 @@ class Config:
     db_name: str = os.getenv("KOVAULT_DB_NAME", "kovault")
     db_user: str = os.getenv("KOVAULT_DB_USER", "kovault")
     db_password: str = _secret("KOVAULT_DB_PASSWORD", "KOVAULT_DB_PASSWORD_FILE", "")
+    auth_token: str = _secret("KOVAULT_AUTH_TOKEN", "KOVAULT_AUTH_TOKEN_FILE", "")
     mcp_host: str = os.getenv("KOVAULT_MCP_HOST", "0.0.0.0")
     mcp_port: int = int(os.getenv("KOVAULT_MCP_PORT", "8000"))
+
+    @property
+    def auth_tokens(self) -> list[str]:
+        """Every token the server accepts (B2). Comma-separated so rotation needs no downtime: add
+        the new token, roll the clients over, then drop the old one. Read from the same
+        env-or-secret-file pair as the DB password, so it is one mechanism, not two.
+
+        EMPTY LIST = the server runs open. That is deliberate — an upgrade must never lock someone
+        out of their own vault, since they cannot fix it without a shell — and main.py shouts about
+        it at every startup."""
+        return [t.strip() for t in (self.auth_token or "").split(",") if t.strip()]
 
     @property
     def dsn(self) -> str:

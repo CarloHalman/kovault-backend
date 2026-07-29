@@ -137,7 +137,7 @@ def build_bundle(dbx: Database, tables: list[str], ids: list[str] | None,
         listing.append(f"- [{label}]({rel}) — {kind}")
 
     if "pages" in tables:
-        pages = dbx.query(f"SELECT * FROM pages WHERE freshness <> 'trashed'{id_filter} ORDER BY title", id_param)
+        pages = dbx.query(f"SELECT * FROM pages WHERE trashed_at IS NULL{id_filter} ORDER BY title", id_param)
         for p in pages:
             hs = dbx.query("SELECT * FROM headers WHERE page_id=%s AND trashed_at IS NULL ORDER BY index", (p["id"],))
             rel = f"pages/{_seg(p.get('type'), 'page')}/{_slug(p['title'], str(p['id']))}.md"
@@ -230,7 +230,7 @@ def counts(dbx: Database, tables: list[str], ids: list[str] | None) -> dict[str,
     out: dict[str, int] = {}
     if "pages" in tables:
         out["pages"] = dbx.query_one(
-            f"SELECT count(*) n FROM pages WHERE freshness <> 'trashed'{id_filter}", id_param)["n"]
+            f"SELECT count(*) n FROM pages WHERE trashed_at IS NULL{id_filter}", id_param)["n"]
     for table in ("tasks", "decisions", "sources"):
         if table in tables:
             out[table] = dbx.query_one(
@@ -274,9 +274,10 @@ def resolve_scope_ids(dbx: Database, group: str | None = None,
     consumes. Returns None when nothing resolves (caller keeps its explicit ids / full scope)."""
     ids: list[str] = []
     if group:
-        row = (dbx.query_one("SELECT id FROM groups WHERE lower(name)=lower(%s) AND archived_at IS NULL "
+        live = "trashed_at IS NULL AND lifecycle <> 'archived'"   # E3, same predicate as lookup
+        row = (dbx.query_one(f"SELECT id FROM groups WHERE lower(name)=lower(%s) AND {live} "
                              "ORDER BY created_at LIMIT 1", (group,))
-               or dbx.query_one("SELECT id FROM groups WHERE name ILIKE %s AND archived_at IS NULL "
+               or dbx.query_one(f"SELECT id FROM groups WHERE name ILIKE %s AND {live} "
                                 "ORDER BY created_at LIMIT 1", (f"%{group}%",)))
         if row:
             ids += [str(r["entity_id"]) for r in dbx.query(

@@ -1,9 +1,8 @@
 # kovault-mcp
 
-The MCP server for Kovault — a knowledge vault. **The only component that holds DB credentials and
-touches Postgres.** Users' Claude Code plugins connect to its HTTP endpoint; the model never
-writes SQL — it calls these tools and the server does the SQL, embedding, RRF, link parsing
-and edit logging.
+MCP server for Kovault, a knowledge vault. **Only component holding DB credentials and touching
+Postgres.** Users' Claude Code plugins connect to its HTTP endpoint. The model never writes SQL; it
+calls these tools and the server does the SQL, embedding, RRF, link parsing and edit logging.
 
 ## Tools
 
@@ -11,15 +10,12 @@ and edit logging.
 |------|-----|------|
 | `lookup` | read | Hybrid vector + BM25 + graph search, RRF fusion, cutoff ladder; CHUNKS + PAGES + page-outline; group filters. |
 | `fetch` | read | Full page / chunk / task / decision / source / group. |
-| `snippet` | read | id/title/summary/freshness for expanding links. |
+| `snippet` | read | id/title/summary (or blurb) for expanding links. `ids`/`titles` are LISTS. |
 | `rows` | read | Backup raw read of any table (op whitelist, hard limit, every call logged). |
 | `sql` | read | Debug-only raw read-only SQL (gated on debug mode, every call logged). |
 | `write` | write | Unified create / update / trash for every entity via `---`-fenced blocks; embeds, parses links, page-rename cascade, appends contributors, logs edits. Also reconciles group members, task blockers, header sources and group archive from the block. |
-| `insert` / `update` / `delete` | write | Legacy single-entity create / edit / trash. **Deprecated, marked for removal** — use `write`. |
-| `link` | write | Manual junction repair (links / header_sources / task_dependencies / group_links). **Deprecated, marked for removal** — `write` reconciles all four from the block. |
-| `group` | write | Create/manage flexible categories + membership. **Deprecated, marked for removal** — `write` covers row/members/archive; only `group list` (a read) has no `write` equivalent. |
-| `janitor` | write | Maintenance: diagnose (bare) + `-lint` / `-freshness` / `-dedupe` / `-embed`. |
-| `export` | read | Manifest (per-table counts + download path) for a no-AI OKF bundle. The bundle itself streams as a zip from the `GET /export` route, so its contents never enter context. |
+| `janitor` | write | Maintenance: diagnose (bare) + `-lint` / `-dedupe` / `-embed` / `-relink` / `-normalize-people`. |
+| `export` | read | Manifest (per-table counts + download path) for a no-AI OKF bundle. Bundle itself streams as a zip from the `GET /export` route, so its contents never enter context. |
 
 ## Layout
 
@@ -52,14 +48,14 @@ python -m kovault_mcp.main            # serves http://0.0.0.0:8000/mcp
 ## Identity
 
 `edited_by` / `actor` are never model-set. The plugin injects them via `X-Kovault-User` /
-`X-Kovault-Actor` HTTP headers (configured by `/kovault:setup`); the server falls back to
+`X-Kovault-Actor` HTTP headers (configured by `/kovault:setup`). Server falls back to
 `KOVAULT_DEFAULT_USER` / `KOVAULT_DEFAULT_ACTOR` env.
 
 ## Deploy-time check
 
-The BM25 predicate/score API (`col @@@ 'terms'`, `paradedb.score(id)`) and the `USING bm25`
-index syntax should be confirmed against the pinned pg_search version in the DB image — this
-is the one piece that varies across ParadeDB releases. Everything else is stock PG16 + pgvector.
+Confirm the BM25 predicate/score API (`col @@@ 'terms'`, `paradedb.score(id)`) and the
+`USING bm25` index syntax against the pinned pg_search version in the DB image. That is the one
+piece varying across ParadeDB releases. Everything else is stock PG16 + pgvector.
 
 ## Tests
 

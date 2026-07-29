@@ -22,18 +22,19 @@ TABLE = {"page": "pages", "task": "tasks", "decision": "decisions",
 # (created/updated/related/blockers/referenced by/contributors/members). id/type/trashed are
 # handled separately; header `body` comes from the post-fence region, not a frontmatter key.
 FIELD_MAP = {
-    "page":     {"title": "title", "description": "summary", "freshness": "freshness", "type": "type",
+    "page":     {"title": "title", "description": "summary", "lifecycle": "lifecycle", "type": "type",
                  "contributors": "contributors"},
     "task":     {"title": "title", "description": "description", "status": "status",
                  "priority": "priority", "scope": "scope", "deadline": "deadline",
-                 "responsible": "responsible"},
-    "decision": {"title": "title", "description": "description", "at": "decided_at", "by": "decided_by"},
+                 "responsible": "responsible", "lifecycle": "lifecycle"},
+    "decision": {"title": "title", "description": "description", "at": "decided_at",
+                 "by": "decided_by", "lifecycle": "lifecycle"},
     "source":   {"title": "title", "description": "summary", "sourcetype": "type",
-                 "reference": "reference", "sha256": "sha256"},
+                 "reference": "reference", "sha256": "sha256", "lifecycle": "lifecycle"},
     "group":    {"name": "name", "description": "description", "grouptype": "type",
-                 "participants": "participants"},
+                 "participants": "participants", "status": "status", "lifecycle": "lifecycle"},
     "header":   {"title": "title", "blurb": "blurb", "page_id": "page_id",
-                 "index": "index", "level": "level"},
+                 "index": "index", "level": "level", "lifecycle": "lifecycle"},
     "edit":     {},   # audit-log row: no writable fields — write supports only delete (trashed:true)
 }
 # columns rendered as a ", "-joined list (render._list) -> split back to a list.
@@ -45,11 +46,17 @@ _ARRAY_COLS = {"responsible", "participants", "contributors"}
 # Key present -> reconcile to that set (empty value clears all); key absent -> leave unchanged.
 _JUNCTION_KEYS = {"task": "blockers", "group": "members", "header": "sources"}
 
+# D1: each roster also takes `<key>_add:` / `<key>_remove:` — touch only the named ids, everyone
+# else on the roster is left alone (the full `<key>:` form still reconciles to an exact set).
+# Adding one id to an 88-member group is one `members_add:` line instead of resending all 88.
+
 # --- anomaly detection (F: no silent failures) -----------------------------------------
 # Keys `fetch` echoes that are read-only metadata or derived from other data — silently
 # ignored on write (a full round-trip includes them; warning on each would be noise).
+# `path` is rebuilt from the page title (_insert_header / _rename_cascade) and `blocking` is the
+# reverse of `blockers`, reconciled from the dependent's side — both render, neither is written.
 _META_KEYS = {"id", "type", "trashed", "created", "updated", "completed", "related",
-              "referenced by"}
+              "referenced by", "path", "blocking"}
 # Keys that carry REAL data written through a different tool, not `write`. Empty now that
 # blockers/members are first-class write fields (see _JUNCTION_KEYS); kept as the guard point
 # if a field is ever moved back out of write.
@@ -60,15 +67,20 @@ _RENAME_HINTS = {kind: {col: key for key, col in m.items() if col != key}
                  for kind, m in FIELD_MAP.items()}
 
 
+def template_key(kind: str, col: str) -> str:
+    """DB column -> the frontmatter key the model actually typed ('description', not 'summary'), so
+    a write-boundary error names what is in front of them. Unmapped columns pass through."""
+    return _RENAME_HINTS.get(kind, {}).get(col, col)
+
+
 def _detect_anomalies(kind: str, raw: dict) -> list[str]:
     """Report frontmatter keys that `write` would silently drop: unknown keys (typos / old
     column names) and other-tool keys carrying a value. Recognized writable + metadata keys
     stay quiet so a clean round-trip reports nothing."""
     recognized = set(FIELD_MAP[kind]) | _META_KEYS
-    if kind in _JUNCTION_KEYS:                 # blockers/members/sources: reconciled, not dropped
-        recognized.add(_JUNCTION_KEYS[kind])
-    if kind == "group":                        # archived round-trip (set/clear archived_at)
-        recognized.add("archived")
+    if kind in _JUNCTION_KEYS:                 # blockers/members/sources (+ _add/_remove, D1): reconciled, not dropped
+        jkey = _JUNCTION_KEYS[kind]
+        recognized |= {jkey, f"{jkey}_add", f"{jkey}_remove"}
     hints = _RENAME_HINTS.get(kind, {})
     warns: list[str] = []
     for key, val in raw.items():
@@ -104,8 +116,18 @@ def _unquote(v: str) -> str:
     return v
 
 
+_HEX = set("0123456789abcdef")
+
+
 def _looks_uuid(x: str) -> bool:
-    return len(x) == 36 and x.count("-") == 4
+    """A full 36-char/4-dash uuid, or a short (C1) hex id prefix — fetch now renders those in a
+    roster line (`blockers:`/`members:`/`sources:`), so this must recognize both to parse a
+    round-tripped write back. Kept re-free (a plain hex-charset check) like the rest of this
+    module; the real id is always the first token in a segment (kind: id — title), so a
+    coincidental hex-looking title WORD is never reached — the loop breaks on the id first."""
+    if len(x) == 36 and x.count("-") == 4:
+        return True
+    return 6 <= len(x) <= 32 and set(x.lower()) <= _HEX
 
 
 def _id_list(value: str | None) -> list[str]:
@@ -178,7 +200,7 @@ def classify(raw: dict) -> str:
 
 
 def parse_block(text: str) -> dict:
-    """One template block -> {kind, table, id, fields, trashed, warnings}. `fields` are DB columns
+    """One template block -> {kind, table, id, fields, trashed, revive?, warnings}. `fields` are DB columns
     (empty value -> None; ", "-list -> list). Raises BlockError on a malformed block."""
     fm_lines, body = _split(text)
     extra = _count_extra_templates(body)
@@ -188,6 +210,15 @@ def parse_block(text: str) -> dict:
             "blocks[] element, not several joined in one string (only the first would be written)")
     raw = _frontmatter(fm_lines)
     kind = classify(raw)
+    jkey = _JUNCTION_KEYS.get(kind)
+    add_key = rem_key = None
+    if jkey:
+        add_key, rem_key = f"{jkey}_add", f"{jkey}_remove"
+        deltas = [k for k in (add_key, rem_key) if k in raw]
+        if jkey in raw and deltas:      # D1 decision 1: both forms is an error, not a merge
+            raise BlockError(
+                f"block has both '{jkey}' (full roster) and {' and '.join(deltas)} (delta) for "
+                "the same roster — send one form, not both")
     fields: dict = {}
     for key, col in FIELD_MAP[kind].items():
         if key in raw:
@@ -197,13 +228,25 @@ def parse_block(text: str) -> dict:
             fields[col] = val
     if kind == "header":
         fields["body"] = body or None
-    trashed = (raw.get("trashed", "").strip().lower() in ("true", "yes", "1")
-               or (kind == "page" and raw.get("freshness") == "trashed"))
+    # `trashed:` is tri-state and identical for every kind (E3): absent -> leave the row's trash
+    # state alone; truthy -> trash it; present-but-empty/false -> revive it (clear trashed_at).
+    # So an unarchive/untrash is just fetch -> clear the line -> write, no separate tool.
+    tv = raw.get("trashed")
+    trashed = tv is not None and tv.strip().lower() in ("true", "yes", "1")
     out = {"kind": kind, "table": TABLE[kind], "id": raw.get("id") or None,
            "fields": fields, "trashed": trashed, "warnings": _detect_anomalies(kind, raw)}
-    jkey = _JUNCTION_KEYS.get(kind)             # present -> reconcile that junction (empty clears all)
-    if jkey and jkey in raw:
+    if tv is not None and not trashed:
+        out["revive"] = True
+    if jkey and jkey in raw:                    # full roster: present -> reconcile (empty clears all)
         out[jkey] = _id_list(raw[jkey])
-    if kind == "group" and "archived" in raw:   # present+value -> set archived_at, present+empty -> clear
-        out["archived"] = raw["archived"].strip()
+    elif jkey:
+        # delta (D1): _add/_remove only touch the named ids, everyone else on the roster is left
+        # alone — the opposite default of the full roster's empty value, which meaningfully clears
+        # everything. So an empty delta value is almost certainly a mistake, not "touch nothing" —
+        # warn instead of silently no-op'ing (kept asymmetric from the full-roster case on purpose).
+        for dkey in (add_key, rem_key):
+            if dkey in raw:
+                if not (raw[dkey] or "").strip():
+                    out["warnings"].append(f"'{dkey}' was empty — no-op")
+                out[dkey] = _id_list(raw[dkey])
     return out

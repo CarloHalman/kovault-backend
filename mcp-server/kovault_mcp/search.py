@@ -178,7 +178,7 @@ edges(a_kind, a_id, b_kind, b_id) AS (
 anchors(kind, id) AS (
     SELECT 'header'::link_kind, h.id
     FROM headers h
-    WHERE h.trashed_at IS NULL AND h.title ILIKE %(pat)s
+    WHERE h.trashed_at IS NULL AND h.lifecycle <> 'archived' AND h.title ILIKE %(pat)s
 ),
 bfs(kind, id, hops) AS (
     SELECT kind, id, 0 FROM anchors

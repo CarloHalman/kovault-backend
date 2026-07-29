@@ -18,10 +18,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "rrf_k": 60,
     "ladder_chunks": {"r": 0.70, "floor": 3, "cap": 9},
     "ladder_pages": {"r": 0.75, "floor": 1, "cap": 6},
-    "freshness_days": {"hot": 30, "warm": 90},
-    "freshness_auto": {"enabled": True, "cooldown_seconds": 3600},
-    "embedding": {"model": "Qwen3-Embedding-8B", "endpoint": "http://embedding:8080", "dims": 4000},
+    # Must stay byte-identical to the row 02-init.sql seeds — this is the fallback used when that
+    # row is missing, so a mismatch means the server silently talks to a different endpoint than
+    # the one the operator configured. `http://embedding:8080` sat here for months and pointed at
+    # nothing; tests/test_deploy_config.py now fails if the two drift again.
+    "embedding": {"model": "qwen3-embedding:8b", "endpoint": "http://embedding:11434", "dims": 4000},
     "embed_worker": {"enabled": True, "poll_seconds": 3, "batch": 32, "max_retries": 3},
+    "debug": False,   # server-side gate for the raw `sql` tool (B2). Off unless an admin says so.
 }
 
 
@@ -48,6 +51,23 @@ class Database:
             yield conn
 
     def query(self, sql: str, params: Any = None) -> list[dict]:
+        # "cached plan must not change result type": a pooled connection prepared this statement
+        # before the schema changed under it. Postgres raises once per connection, that connection
+        # re-plans, and the next attempt on it succeeds — so a column added to a LIVE server (an
+        # extension running its own migration, which is what the `columns` parameter exists to
+        # surface) costs a retry rather than erroring until someone restarts the process.
+        # Bounded by the pool size, not by 1: a retry can be handed a different stale connection,
+        # and each one can only raise once. Measured 2 failures across 30 calls on an 8-connection
+        # pool before this, 0 after.
+        for attempt in range(self._pool.max_size):
+            try:
+                return self._query(sql, params)
+            except psycopg.errors.FeatureNotSupported:
+                if attempt == self._pool.max_size - 1:
+                    raise
+        raise AssertionError("unreachable")          # loop either returns or re-raises
+
+    def _query(self, sql: str, params: Any = None) -> list[dict]:
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
