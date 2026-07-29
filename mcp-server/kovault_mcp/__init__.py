@@ -5,4 +5,4 @@ export) as MCP tools over an HTTP endpoint. The model never writes SQL; it fills
 tool inputs and the server does the heavy lifting (embedding, RRF, link parsing, edits log).
 """
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"

@@ -16,6 +16,9 @@ cd kovault-backend
 - **Embedding endpoint** reachable from the `kovault-mcp` container, OpenAI-compatible
   **`/v1/embeddings`**, model emitting **at least 4000 dimensions** (step 3). Bundled
   [`embedding/`](embedding/) service or your own.
+- **Windows, Docker Desktop:** the daemon must be able to see the directory you clone into. Where
+  it cannot, the secret mounts in step 5 fail with `bind source path does not exist`, naming a file
+  that is sitting right there on disk.
 
 ## 1. Create the shared network
 
@@ -28,10 +31,19 @@ docker network create kovault-net
 
 ## 2. Set the secrets
 
+Steps 2, 4, 5 and 6 all run in `docker/`:
+
 ```bash
 cd docker
-cp secrets/kovault_db_password.txt.example secrets/kovault_db_password.txt   # a real password
-cp secrets/kovault_auth_token.txt.example  secrets/kovault_auth_token.txt    # a long random string
+```
+
+**Generate both files. Do not copy the `.example` ones into place** — they hold the literal
+placeholders `change-me-before-production` and `change-me-to-a-long-random-string`, and a stack
+started on those is a stack anyone who reads this page can open:
+
+```bash
+openssl rand -base64 32 > secrets/kovault_db_password.txt
+openssl rand -base64 32 > secrets/kovault_auth_token.txt
 ```
 
 Auth token guards **every** route: tool surface, zip export, everything. Empty file runs without
@@ -44,12 +56,12 @@ Needs an OpenAI-compatible `/v1/embeddings` endpoint, model emitting **at least 
 Bundled service or your own.
 
 Setup, models, the `embedding` setting, why the bundled one publishes no host port:
-**[`embedding/README.md`](embedding/README.md)**.
+**[`embedding/README.md`](embedding/README.md)**. Its steps start from the repo root, so `cd ..`
+first and `cd docker` again when you come back for step 4.
 
 ## 4. Choose what the ports are exposed to
 
 ```bash
-cd docker
 cp .env.example .env
 ```
 
@@ -61,7 +73,6 @@ read and write the entire vault and download it as a zip.
 ## 5. Build and run Kovault
 
 ```bash
-cd docker
 docker compose up --build
 ```
 

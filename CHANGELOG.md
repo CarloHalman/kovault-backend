@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.5.1
+
+Documentation fixes found by installing 1.5.0 from a clean clone and following the README
+literally. No code or schema change; the server is identical to 1.5.0.
+
+1. **The install steps did not run as written.** Steps 2, 4, 5 and 6 each began with `cd docker`,
+   so every one after the first failed with `No such file or directory`. The directory change is
+   now stated once, and step 3 says how to get back from `embedding/`.
+
+2. **The secret files were copied but never edited.** Step 2 copied
+   `secrets/kovault_db_password.txt.example` and `secrets/kovault_auth_token.txt.example` into
+   place and no later step said to change them, so anyone following the README exactly deployed
+   with the published placeholders `change-me-before-production` and
+   `change-me-to-a-long-random-string` as their database password and auth token. Step 2 now
+   generates both with `openssl rand -base64 32` instead of copying, and the compose file's
+   comments say the same. **If you installed 1.5.0 by following the README, check
+   `docker/secrets/` for those two strings and replace them.**
+
+3. **Docker Desktop on Windows** must be able to see the directory you clone into. Where it
+   cannot, the secret mounts fail with `bind source path does not exist` naming a file that is
+   present on disk. Noted in the prerequisites.
+
 ## 1.5.0
 
 This file covers the `kovault-backend` half of the release. The plugin's half is `kovault`'s

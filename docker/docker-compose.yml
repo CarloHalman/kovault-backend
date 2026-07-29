@@ -84,9 +84,9 @@ networks:
 
 secrets:
   kovault_db_password:
-    file: ./secrets/kovault_db_password.txt   # cp secrets/kovault_db_password.txt.example and edit
+    file: ./secrets/kovault_db_password.txt   # openssl rand -base64 32 > this file, never the .example
   kovault_auth_token:
-    # cp secrets/kovault_auth_token.txt.example and put a long random string in it.
+    # openssl rand -base64 32 > this file. Never copy the .example one into place, it is a placeholder.
     # UPGRADING: this file must EXIST or compose refuses to start the stack. `touch` it to keep
     # the pre-1.5.0 open behaviour, then add a token when you are ready.
     file: ./secrets/kovault_auth_token.txt
