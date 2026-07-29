@@ -130,17 +130,38 @@ def _looks_uuid(x: str) -> bool:
     return 6 <= len(x) <= 32 and set(x.lower()) <= _HEX
 
 
-def _id_list(value: str | None) -> list[str]:
-    """Parse a rendered junction roster into entity ids. Handles every render shape:
+def _flow_items(value: str | None) -> list[str]:
+    """Split a rendered comma list into trimmed, non-empty items, tolerating a flow-style
+    `[a, b, c]` wrapper.
+
+    The brackets are the whole point. render.py never emits them, but they are the form the tool
+    docs show and the form a model reaches for, and every consumer here splits on ',' — so without
+    stripping them the FIRST and LAST item arrive as '[a' and 'c]'. That silently dropped ids from
+    rosters and, worse, stored '[alice' as a person's name in the array columns. One strip, in the
+    one place both paths split, so the two cannot drift apart again."""
+    return [p.strip() for p in (value or "").strip().strip("[]").split(",") if p.strip()]
+
+
+def _id_list(value: str | None) -> tuple[list[str], list[str]]:
+    """Parse a rendered junction roster into (entity ids, warnings). Handles every render shape:
     'kind: id — label, ...' (members), 'id — title, ...' (blockers), 'id, ...' (sources) — take
-    the first uuid-looking token of each comma segment; kind/label sugar is dropped."""
+    the first uuid-looking token of each comma segment; kind/label sugar is dropped.
+
+    Splitting goes through _flow_items, so `members_add: [a, b, c]` works — see there for what the
+    brackets used to cost.
+
+    A segment that carries text but yields no id is reported, never dropped in silence: a supplied
+    id that goes nowhere is the caller's bug to see, not ours to swallow."""
     ids: list[str] = []
-    for seg in (value or "").split(","):
+    warns: list[str] = []
+    for seg in _flow_items(value):
         for tok in seg.replace(":", " ").split():
             if _looks_uuid(tok):
                 ids.append(tok)
                 break
-    return ids
+        else:
+            warns.append(f"roster entry '{seg}' has no id in it — dropped")
+    return ids, warns
 
 
 def _split(text: str) -> tuple[list[str], str]:
@@ -224,21 +245,37 @@ def parse_block(text: str) -> dict:
         if key in raw:
             val = raw[key] or None
             if col in _ARRAY_COLS and val is not None:
-                val = [p.strip() for p in val.split(",") if p.strip()] or None
+                # Same splitter as the id rosters: `participants: [alice, bob]` used to store
+                # '[alice' and 'bob]' as literal names — silent corruption, not a dropped value.
+                val = _flow_items(val) or None
             fields[col] = val
+    body_warns: list[str] = []
     if kind == "header":
         fields["body"] = body or None
+    elif kind != "page" and body.strip():
+        # A chunk STORES its body; a page renders its document (title + chunks) after the fence and
+        # legitimately round-trips with one, so neither warns. Every other kind renders an empty
+        # post-fence region and carries its prose in a frontmatter field instead.
+        # Text after the fence used to be discarded without a word, so a task written with its
+        # detail in the body inserted with description NULL and still reported `inserted` — content
+        # supplied, success reported, content gone. Unknown KEYS already warn; this is the same
+        # mistake one line further down, and it costs the whole description, not one field.
+        tail = " — put it in 'description:' instead" if "description" in FIELD_MAP[kind] else ""
+        body_warns.append(
+            f"text after the closing --- is a body only on a header, not on a {kind}{tail} — dropped")
     # `trashed:` is tri-state and identical for every kind (E3): absent -> leave the row's trash
     # state alone; truthy -> trash it; present-but-empty/false -> revive it (clear trashed_at).
     # So an unarchive/untrash is just fetch -> clear the line -> write, no separate tool.
     tv = raw.get("trashed")
     trashed = tv is not None and tv.strip().lower() in ("true", "yes", "1")
     out = {"kind": kind, "table": TABLE[kind], "id": raw.get("id") or None,
-           "fields": fields, "trashed": trashed, "warnings": _detect_anomalies(kind, raw)}
+           "fields": fields, "trashed": trashed,
+           "warnings": _detect_anomalies(kind, raw) + body_warns}
     if tv is not None and not trashed:
         out["revive"] = True
     if jkey and jkey in raw:                    # full roster: present -> reconcile (empty clears all)
-        out[jkey] = _id_list(raw[jkey])
+        out[jkey], w = _id_list(raw[jkey])
+        out["warnings"] += w
     elif jkey:
         # delta (D1): _add/_remove only touch the named ids, everyone else on the roster is left
         # alone — the opposite default of the full roster's empty value, which meaningfully clears
@@ -248,5 +285,6 @@ def parse_block(text: str) -> dict:
             if dkey in raw:
                 if not (raw[dkey] or "").strip():
                     out["warnings"].append(f"'{dkey}' was empty — no-op")
-                out[dkey] = _id_list(raw[dkey])
+                out[dkey], w = _id_list(raw[dkey])
+                out["warnings"] += w
     return out

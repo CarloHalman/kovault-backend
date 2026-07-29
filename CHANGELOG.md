@@ -1,5 +1,49 @@
 # Changelog
 
+## 1.5.2
+
+Bugfixes. No schema-breaking change and no new capability. Three of these are the same shape: the
+call reported success and quietly did the wrong thing.
+
+1. **Backups restore again.** `f_unaccent` called `unaccent` unqualified, and `pg_restore` runs with
+   an empty `search_path`, so every table carrying a `*_norm` generated column failed to create and
+   the restore collapsed. The function now resolves the extension's real schema and pins
+   `search_path`. **A dump taken before 1.5.2 still carries the old function** — `pg_dump` writes it
+   as it stood in the source database — so for those, run `docker/migrate_1.5.2.sql` against the
+   empty target *first*, then restore into it. Run the migration on your live database too and dumps
+   you take from then on restore with a plain `pg_restore`. See Upgrading in the README.
+
+2. **Bracketed lists lost their first and last entry.** `members_add: [a, b, c]` linked only `b`;
+   two ids linked none; one id linked none. The brackets were not stripped, so the outer entries
+   arrived as `[a` and `c]` and resolved to nothing — and the write still reported success. The
+   same splitter is now used everywhere, so the documented bracketed form works, and a roster entry
+   that yields no id is reported instead of dropped.
+
+3. **The person arrays stored the brackets as names.** Same root cause, worse effect:
+   `participants: [alice, bob]` wrote `'[alice'` and `'bob]'` into `participants` / `responsible` /
+   `contributors` as literal names. That is silent corruption rather than a lost value. If you wrote
+   a bracketed person list on 1.5.0 or 1.5.1, check those columns for entries starting `[` or ending
+   `]`.
+
+4. **`groups_include` did not filter in precise mode.** A group-scoped count returned the whole
+   table. Ranked mode was already correct. Both modes also returned everything when an include
+   resolved to no group at all; they now return nothing, which is the honest answer.
+
+5. **Body text on a block that does not render one is now reported.** A `task` / `decision` /
+   `source` / `group` block whose detail sat after the closing fence had it silently discarded
+   while the write reported success — `description:` is a frontmatter field for those types. Pages
+   and headers legitimately carry a body and stay quiet.
+
+6. **Two stacks can share a host.** `container_name` was hardcoded, and container names are global
+   to the host, so a second stack collided no matter what `-p` project name was passed. Both keys
+   are gone; names now come from the project. The README notes the related trap that compose
+   *appends* to a `ports:` list when merging `-f` files rather than replacing it.
+
+7. **Vectors are locked out of every tool result in one place** instead of per tool, so a newly
+   added tool cannot reopen the hole. No leak existed — `rows` already filtered and no other
+   surface selected embeddings — this is hardening, not a fix. Raw vector access stays available
+   through the debug-gated `sql` tool.
+
 ## 1.5.1
 
 Documentation fixes found by installing 1.5.0 from a clean clone and following the README

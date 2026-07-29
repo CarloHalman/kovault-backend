@@ -21,8 +21,23 @@ CREATE EXTENSION IF NOT EXISTS unaccent;    -- accent-folding for the normalized
 
 -- IMMUTABLE unaccent wrapper: bare unaccent() is only STABLE, so it cannot be used in a generated
 -- column or expression index. Naming the dictionary explicitly makes it safe to mark IMMUTABLE.
-CREATE OR REPLACE FUNCTION f_unaccent(text) RETURNS text
-  LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$ SELECT unaccent('unaccent', $1) $$;
+--
+-- search_path is PINNED to the schema unaccent actually landed in, and that pin is load-bearing:
+-- pg_restore runs with an empty search_path, so an unpinned body cannot resolve either unaccent()
+-- or the 'unaccent' regdictionary, and every table below carrying a *_norm generated column fails
+-- to create — the restore of a Kovault backup collapses. Resolved dynamically rather than written
+-- as public.unaccent(...) so it still holds when the extension lives in a non-public schema.
+DO $do$
+DECLARE ext_schema text;
+BEGIN
+  SELECT n.nspname INTO ext_schema
+    FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+   WHERE e.extname = 'unaccent';
+  EXECUTE format(
+    'CREATE OR REPLACE FUNCTION f_unaccent(text) RETURNS text
+       LANGUAGE sql IMMUTABLE PARALLEL SAFE SET search_path = %I, pg_catalog
+       AS $f$ SELECT unaccent(''unaccent'', $1) $f$', ext_schema);
+END $do$;
 
 -- ---------------- Enums ----------------
 CREATE TYPE entity_kind      AS ENUM ('source', 'task', 'page', 'decision');

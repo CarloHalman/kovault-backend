@@ -80,6 +80,11 @@ Brings up the `kovault` project (kovault-db + kovault-mcp, grouped). First boot 
 then `02-init.sql` automatically. DB image is `paradedb/paradedb` (pgvector + pg_search prebuilt);
 pg_trgm is stock contrib.
 
+Second stack on the same host? `docker compose -p <other-name> up` — container names come from the
+project, so nothing collides. One trap: compose **appends** to `ports:` when merging `-f` files, it
+does not replace, so an override that moves a port leaves the original binding in place and the
+container tries to bind both. Tag the key `ports: !override` to replace.
+
 ## 6. Verify
 
 ```bash
@@ -106,6 +111,23 @@ only the newest, migrations stack.
 
 Raw diff instead: releases are tagged, so `git diff v1.4.1..v1.5.0` (or GitHub's compare view) shows
 everything that changed.
+
+### Restoring a backup taken before 1.5.2
+
+Dumps from 1.5.1 and earlier do not restore with a plain `pg_restore`. `f_unaccent` shipped without
+a pinned `search_path`, `pg_restore` runs with an empty one, and every table with a `*_norm`
+generated column fails to create. The dump is fine; the restore is what breaks.
+
+Run the migration against the empty target **first**, then restore into it:
+
+```bash
+psql "$KOVAULT_DSN" -f docker/migrate_1.5.2.sql   # on the new, empty database
+pg_restore -U kovault -d kovault your-backup.dump
+```
+
+The dump's own `CREATE FUNCTION f_unaccent` then fails with `already exists`, `pg_restore` carries
+on, and the fixed function is the one the generated columns use. Run `migrate_1.5.2.sql` on your
+live database too, so dumps you take from now on restore without the dance.
 
 ## Notes
 

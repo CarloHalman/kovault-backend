@@ -46,13 +46,13 @@ class Case(unittest.TestCase):
 
 class TestContentOverlapQuery(Case):
     def test_shape_and_params(self):
-        row = {"name_a": "wiki-database", "id_a": GID_A, "name_b": "old-llm-wiki-database",
+        row = {"name_a": "alpha-notes", "id_a": GID_A, "name_b": "old-alpha-notes",
                "id_b": GID_B, "size_a": 69, "size_b": 55, "shared": 40, "pct": 57.1}
         db = RecordingDB({"shared AS": [row]})
         sv._DB = db
         out = sv._dup_groups_by_content()
-        self.assertEqual(out, [{"name_a": "wiki-database", "id_a": GID_A[:8], "size_a": 69,
-                                "name_b": "old-llm-wiki-database", "id_b": GID_B[:8], "size_b": 55,
+        self.assertEqual(out, [{"name_a": "alpha-notes", "id_a": GID_A[:8], "size_a": 69,
+                                "name_b": "old-alpha-notes", "id_b": GID_B[:8], "size_b": 55,
                                 "shared": 40, "pct": 57.1}])
         sql, params = db.calls[0]
         self.assertIn("ga.type = gb.type", sql)              # same-type only: no area/topic nesting
@@ -78,13 +78,13 @@ class TestContentOverlapQuery(Case):
 
 class TestNameSimilarityQuery(Case):
     def test_shape_and_params(self):
-        row = {"name_a": "wiki-database", "id_a": GID_A, "size_a": 69,
-               "name_b": "wiki-database (empty duplicate)", "id_b": GID_B, "size_b": 0, "pct": 64.0}
+        row = {"name_a": "alpha-notes", "id_a": GID_A, "size_a": 69,
+               "name_b": "alpha-notes (empty duplicate)", "id_b": GID_B, "size_b": 0, "pct": 64.0}
         db = RecordingDB({"similarity(a.name, b.name)": [row]})
         sv._DB = db
         out = sv._dup_groups_by_name()
-        self.assertEqual(out, [{"name_a": "wiki-database", "id_a": GID_A[:8], "size_a": 69,
-                                "name_b": "wiki-database (empty duplicate)", "id_b": GID_B[:8],
+        self.assertEqual(out, [{"name_a": "alpha-notes", "id_a": GID_A[:8], "size_a": 69,
+                                "name_b": "alpha-notes (empty duplicate)", "id_b": GID_B[:8],
                                 "size_b": 0, "pct": 64.0}])
         sql, params = db.calls[0]
         self.assertIn("regexp_replace(lower(a.name)", sql)   # numbered-series stem exclusion
@@ -120,8 +120,8 @@ class TestJanitorDiagnose(Case):
         sv._dup_groups_by_content = lambda: [{"name_a": "A", "id_a": "aaaaaaaa", "size_a": 3,
                                               "name_b": "B", "id_b": "bbbbbbbb", "size_b": 3,
                                               "shared": 3, "pct": 100.0}]
-        sv._dup_groups_by_name = lambda: [{"name_a": "wiki-database", "id_a": "aaaaaaaa",
-                                          "name_b": "old-llm-wiki-database", "id_b": "bbbbbbbb",
+        sv._dup_groups_by_name = lambda: [{"name_a": "alpha-notes", "id_a": "aaaaaaaa",
+                                          "name_b": "old-alpha-notes", "id_b": "bbbbbbbb",
                                           "pct": 48.0}]
         rows_by_call = iter([
             [{"n": 0}], [{"n": 0}], [{"n": 0}], [{"n": 0}], [{"n": 0}],   # stale x4, trashed
@@ -140,7 +140,7 @@ class TestJanitorDiagnose(Case):
         sv._DB = SeqDB()
         diag = sv._janitor_diagnose()
         self.assertEqual(diag["duplicate_groups_content"][0]["pct"], 100.0)
-        self.assertEqual(diag["duplicate_groups_name"][0]["name_b"], "old-llm-wiki-database")
+        self.assertEqual(diag["duplicate_groups_name"][0]["name_b"], "old-alpha-notes")
         self.assertEqual(diag["orphan_tasks"], 5)
         self.assertEqual(diag["orphan_task_sample"], [{"id": TID_A[:8], "title": "Do the thing"}])
 
@@ -190,12 +190,12 @@ class TestJanitorReportRendering(Case):
             "stale_embeddings": 0, "trashed_pages": 0, "dangling_header_links": 0,
             "redundant_blocks": 0, "orphan_tasks": 0, "orphan_task_sample": [],
             "duplicate_groups_content": [],
-            "duplicate_groups_name": [{"name_a": "wiki-database", "id_a": "aaaaaaaa", "size_a": 69,
-                                      "name_b": "old-llm-wiki-database", "id_b": "bbbbbbbb",
+            "duplicate_groups_name": [{"name_a": "alpha-notes", "id_a": "aaaaaaaa", "size_a": 69,
+                                      "name_b": "old-alpha-notes", "id_b": "bbbbbbbb",
                                       "size_b": 55, "pct": 48.0}],
         })
-        self.assertIn('"wiki-database"', out)
-        self.assertIn('"old-llm-wiki-database"', out)
+        self.assertIn('"alpha-notes"', out)
+        self.assertIn('"old-alpha-notes"', out)
         self.assertIn("48.0%", out)
 
     def test_no_bench_pairs_leak_through_when_diagnose_returns_none(self):

@@ -199,10 +199,44 @@ class TestBlocksShortIdParsing(unittest.TestCase):
 
     def test_id_list_extracts_short_blocker_ids(self):
         self.assertEqual(bl._id_list(f"{TASK_A[:8]} — design, {TASK_B[:8]} — spec"),
-                         [TASK_A[:8], TASK_B[:8]])
+                         ([TASK_A[:8], TASK_B[:8]], []))
 
     def test_id_list_extracts_short_member_ids_with_kind_prefix(self):
-        self.assertEqual(bl._id_list(f"task: {TASK_A[:8]} — Some Task"), [TASK_A[:8]])
+        self.assertEqual(bl._id_list(f"task: {TASK_A[:8]} — Some Task"), ([TASK_A[:8]], []))
+
+    def test_id_list_strips_flow_style_brackets(self):
+        """The bracketed form is what the tool docs show, and it used to lose its FIRST and LAST
+        entry: split on ',' left '[a' and 'c]', neither matched _looks_uuid, both were dropped —
+        and the write still reported success."""
+        self.assertEqual(bl._id_list(f"[{TASK_A}, {TASK_B}]"), ([TASK_A, TASK_B], []))
+        self.assertEqual(bl._id_list(f"[{TASK_A}]"), ([TASK_A], []))          # single: was empty
+        self.assertEqual(bl._id_list(f"{TASK_A}, {TASK_B}"), ([TASK_A, TASK_B], []))   # unbracketed still fine
+
+    def test_id_list_reports_an_entry_it_cannot_read(self):
+        ids, warns = bl._id_list(f"{TASK_A}, not-an-id-at-all")
+        self.assertEqual(ids, [TASK_A])
+        self.assertEqual(len(warns), 1)
+        self.assertIn("not-an-id-at-all", warns[0])
+
+    def test_array_columns_strip_flow_style_brackets(self):
+        """Same root cause as the roster case, worse symptom: the people arrays split on ',' too,
+        so `participants: [alice, bob]` STORED '[alice' and 'bob]' as names — silent corruption
+        rather than a dropped value."""
+        p = bl.parse_block("---\ntype: group\nname: g\nparticipants: [alice, bob]\n---")
+        self.assertEqual(p["fields"]["participants"], ["alice", "bob"])
+        p = bl.parse_block("---\ntype: task\ntitle: t\nresponsible: [ada, grace]\n---")
+        self.assertEqual(p["fields"]["responsible"], ["ada", "grace"])
+        p = bl.parse_block("---\ntype: group\nname: g\nparticipants: alice, bob\n---")
+        self.assertEqual(p["fields"]["participants"], ["alice", "bob"])   # unbracketed unchanged
+
+    def test_body_on_a_task_is_reported_not_swallowed(self):
+        """A task carries its prose in `description:`; text after the fence was dropped in silence,
+        so a task written that way inserted with description NULL and still said `inserted`."""
+        p = bl.parse_block("---\ntype: task\ntitle: t\n---\ndetail that goes nowhere")
+        self.assertTrue(any("dropped" in w for w in p["warnings"]), p["warnings"])
+        # a page renders its document after the fence and must stay quiet
+        p = bl.parse_block("---\ntype: note\ntitle: t\n---\nPage document")
+        self.assertEqual(p["warnings"], [])
 
 
 class TestDispatchBlockIdResolution(Case):

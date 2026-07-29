@@ -38,8 +38,20 @@ CREATE TRIGGER trg_tasks_completed BEFORE INSERT OR UPDATE ON tasks
 -- unaccent is stock contrib and ships in the paradedb image; this errors loudly if absent
 -- (check first with: SELECT 1 FROM pg_available_extensions WHERE name='unaccent').
 CREATE EXTENSION IF NOT EXISTS unaccent;
-CREATE OR REPLACE FUNCTION f_unaccent(text) RETURNS text
-  LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$ SELECT unaccent('unaccent', $1) $$;
+-- search_path pinned to the extension's real schema — see the same block in 01-schema.sql for why
+-- (pg_restore runs with an empty search_path; an unpinned body makes every *_norm column below
+-- unrestorable). Resolved dynamically so it holds for a non-public extension schema too.
+DO $do$
+DECLARE ext_schema text;
+BEGIN
+  SELECT n.nspname INTO ext_schema
+    FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+   WHERE e.extname = 'unaccent';
+  EXECUTE format(
+    'CREATE OR REPLACE FUNCTION f_unaccent(text) RETURNS text
+       LANGUAGE sql IMMUTABLE PARALLEL SAFE SET search_path = %I, pg_catalog
+       AS $f$ SELECT unaccent(''unaccent'', $1) $f$', ext_schema);
+END $do$;
 
 -- Adding a STORED generated column rewrites the table (seconds at a few-k rows) and fills it in.
 ALTER TABLE headers   ADD COLUMN IF NOT EXISTS title_norm text

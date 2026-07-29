@@ -14,7 +14,10 @@ name: kovault
 
 services:
   kovault-db:
-    container_name: kovault-database   # stable name; the service key stays kovault-db (network alias)
+    # No container_name on purpose. A container_name is global to the host, so pinning one makes a
+    # second stack collide no matter what `-p` project name you pass. Compose derives the name from
+    # the project instead (kovault-kovault-db-1 by default). Other services still reach this one as
+    # `kovault-db`, the service key, which is the network alias.
     restart: unless-stopped         # returns after a host reboot
     build:
       context: .
@@ -39,7 +42,8 @@ services:
       retries: 20
 
   kovault-mcp:
-    container_name: kovault-mcp
+    # No container_name — same reason as kovault-db above. Reachable as `kovault-mcp` on the
+    # network either way, since that is the service key.
     restart: unless-stopped
     build:
       context: ../mcp-server
